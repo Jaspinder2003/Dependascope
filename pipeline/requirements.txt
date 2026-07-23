@@ -1,0 +1,11 @@
+# Dependabot Failure Research Pipeline – Python dependencies
+# Install with: pip install -r requirements.txt
+
+duckdb>=1.0.0
+polars>=1.0.0
+pyarrow>=16.0.0
+openpyxl>=3.1.0
+requests>=2.32.0
+pyyaml>=6.0.0
+tqdm>=4.60.0
+packaging>=24.0

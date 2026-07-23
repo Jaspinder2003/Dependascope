@@ -1,0 +1,42 @@
+# Raw research datasets
+Partition (1)/
+Partition (2)/
+Derived Sample/
+__MACOSX/
+*.rar
+*.zip
+*.xlsx
+
+# Generated research data
+output/
+outputs/
+cache/
+github_api_cache/
+repository_cache/
+repo_snapshots/
+execution_logs/
+logs/
+*.sqlite
+*.sqlite3
+*.db
+*.parquet
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
