@@ -45,7 +45,8 @@ def repo_cache_path(repo: str) -> Path:
     return C.REPO_CACHE_DIR / safe
 
 
-def clone_or_update(repo: str, head_sha: str, before_sha: Optional[str]) -> tuple[bool, str]:
+def clone_or_update(repo: str, head_sha: str, before_sha: Optional[str],
+                    pr_number: Optional[int] = None) -> tuple[bool, str]:
     """
     Ensure both head_sha and before_sha are available in the local cache.
     Returns (success, error_message).
@@ -69,42 +70,58 @@ def clone_or_update(repo: str, head_sha: str, before_sha: Optional[str]) -> tupl
         return rc == 0
 
     def fetch_sha(sha: str) -> tuple[bool, str]:
-        # Try direct SHA fetch first
-        rc, out, err = _run([
-            "git", "-C", str(cache), "fetch", "--depth", str(C.GIT_SHALLOW_DEPTH),
-            "origin", sha
-        ])
-        if rc == 0:
+        if sha_present(sha):
             return True, ""
-        # Fallback: fetch PR head ref
+
+        # Strategy 1: fetch the PR ref (always available on GitHub)
+        if pr_number:
+            rc, out, err = _run([
+                "git", "-C", str(cache), "fetch",
+                "--depth", str(C.GIT_SHALLOW_DEPTH * 2),
+                "origin",
+                f"refs/pull/{pr_number}/head",
+            ])
+            if rc == 0 and sha_present(sha):
+                return True, ""
+
+        # Strategy 2: direct SHA fetch
         rc, out, err = _run([
-            "git", "-C", str(cache), "fetch", "--depth", str(C.GIT_SHALLOW_DEPTH * 5),
+            "git", "-C", str(cache), "fetch",
+            "--depth", str(C.GIT_SHALLOW_DEPTH),
+            "origin", sha,
+        ])
+        if rc == 0 and sha_present(sha):
+            return True, ""
+
+        # Strategy 3: unshallow the whole repo (slow but reliable)
+        rc, out, err = _run([
+            "git", "-C", str(cache), "fetch",
+            "--unshallow", "origin",
+        ])
+        if rc == 0 and sha_present(sha):
+            return True, ""
+
+        # Strategy 4: plain fetch with more depth
+        rc, out, err = _run([
+            "git", "-C", str(cache), "fetch",
+            "--depth", str(C.GIT_SHALLOW_DEPTH * 20),
             "origin",
         ])
         if rc == 0 and sha_present(sha):
             return True, ""
-        return False, err
+
+        return False, f"Could not fetch {sha}: {err}"
 
     # ── Fetch head_sha ────────────────────────────────────────────────────────
-    if not sha_present(head_sha):
-        ok, err = fetch_sha(head_sha)
-        if not ok:
-            return False, f"Could not fetch head_sha {head_sha}: {err}"
+    ok, err = fetch_sha(head_sha)
+    if not ok:
+        return False, f"Could not fetch head_sha {head_sha}: {err}"
 
-    # ── Fetch before_sha ──────────────────────────────────────────────────────
-    if before_sha and not sha_present(before_sha):
-        # before_sha is the parent; it might already be in shallow history
-        rc, out, _ = _run([
-            "git", "-C", str(cache), "rev-parse", "--verify", before_sha
-        ])
-        if rc != 0:
-            # Deepen fetch
-            rc, out, err = _run([
-                "git", "-C", str(cache), "fetch", "--depth",
-                str(C.GIT_SHALLOW_DEPTH * 10), "origin"
-            ])
-            if rc != 0 or not sha_present(before_sha):
-                return False, f"Could not fetch before_sha {before_sha}"
+    # ── Fetch before_sha ─────────────────────────────────────────────────────
+    if before_sha:
+        ok, err = fetch_sha(before_sha)
+        if not ok:
+            return False, f"Could not fetch before_sha {before_sha}: {err}"
 
     return True, ""
 
@@ -145,11 +162,14 @@ def checkout_snapshot_worktree(repo: str, sha: str, work_dir: Path) -> tuple[boo
     More reliable for binary files.
     """
     cache = repo_cache_path(repo)
+    clone_url = f"https://github.com/{repo}.git"
 
-    # Clone from cache into work_dir
+    # Clone from cache using --local (copies objects via hardlinks AND copies
+    # the shallow file - unlike --shared which skips the shallow file and causes
+    # "reference is not a tree" errors)
     rc, out, err = _run([
         "git", "clone",
-        "--shared",          # use objects from cache
+        "--local",        # hardlinks + copies shallow boundary file
         "--no-checkout",
         str(cache),
         str(work_dir),
@@ -158,7 +178,18 @@ def checkout_snapshot_worktree(repo: str, sha: str, work_dir: Path) -> tuple[boo
         return False, f"git clone failed: {err}"
 
     rc, out, err = _run(["git", "checkout", sha], cwd=work_dir)
+    if rc == 0:
+        return True, ""
+
+    # Checkout failed - SHA might be missing from shallow clone.
+    # Fetch it directly from GitHub and retry.
+    logger.debug(f"  Checkout {sha[:8]} failed, fetching directly from GitHub …")
+    _run([
+        "git", "-C", str(work_dir), "fetch",
+        "--depth", str(C.GIT_SHALLOW_DEPTH * 2),
+        "origin", sha,
+    ])
+    rc, out, err = _run(["git", "checkout", sha], cwd=work_dir)
     if rc != 0:
         return False, f"git checkout {sha} failed: {err}"
-
     return True, ""

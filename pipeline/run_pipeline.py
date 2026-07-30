@@ -67,7 +67,7 @@ def main():
                         help="Sort queue by failure likelihood")
     parser.add_argument("--max-per-repo",   type=int,  default=C.MAX_PRS_PER_REPO,
                         help="Max PRs per repository in reproduction")
-    parser.add_argument("--timeout",        type=int,  default=C.EXEC_TIMEOUT,
+    parser.add_argument("--timeout",        type=int,  default=C.EXEC_TIMEOUT_TOTAL,
                         help="Per-stage timeout seconds")
     parser.add_argument("--skip-stages",    type=str,  default="",
                         help="Comma-separated stages to skip (e.g. '1,2')")

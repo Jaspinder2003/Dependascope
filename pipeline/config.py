@@ -102,9 +102,9 @@ DOCKER_PIDS_LIMIT      = 256
 DOCKER_TMP_SIZE        = "2g"           # /workspace tmpfs size
 
 # Timeouts
-EXEC_TIMEOUT_INSTALL   = 600            # seconds – install phase (network on)
-EXEC_TIMEOUT_TEST      = 600            # seconds – build/test phase
-EXEC_TIMEOUT_TOTAL     = 1200           # hard wall-clock limit per snapshot
+EXEC_TIMEOUT_INSTALL   = 300            # seconds – install phase (network on)
+EXEC_TIMEOUT_TEST      = 120            # seconds – build/test phase (CI=true prevents watch mode)
+EXEC_TIMEOUT_TOTAL     = 600            # hard wall-clock limit per snapshot
 
 # Network policy values (stored in executions.network_policy)
 NETWORK_POLICY_PHASED  = "phased_install_net_test_isolated"

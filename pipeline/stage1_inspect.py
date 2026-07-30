@@ -18,8 +18,10 @@ import openpyxl
 sys.path.insert(0, str(Path(__file__).parent))
 from config import (
     DATA_DIR, PARTITION1, PARTITION2, DERIVED, OUTPUT_DIR, LOG_DIR,
-    DATASET_SOURCES
 )
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,

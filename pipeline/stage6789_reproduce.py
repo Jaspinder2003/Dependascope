@@ -94,7 +94,7 @@ def reproduce_pr(
 
     # ── Stage 6: Fetch Git history ─────────────────────────────────────────
     logger.info(f"Fetching commits for {repo}#{pr_number} …")
-    ok, err = gf.clone_or_update(repo, head_sha, before_sha)
+    ok, err = gf.clone_or_update(repo, head_sha, before_sha, pr_number=pr_number)
     if not ok:
         logger.warning(f"  Git fetch failed: {err}")
         result["error"] = f"git_fetch_failed: {err}"
@@ -271,10 +271,10 @@ def main(args: argparse.Namespace) -> None:
     where = " AND ".join(where_clauses)
     sql = f"""
         SELECT pr.repo, pr.pr_number, pr.head_sha, pr.before_sha,
-               pr.ecosystem, pr.priority_score
+               pr.ecosystem, pr.local_priority_score
         FROM pull_requests pr
         WHERE {where}
-        ORDER BY pr.priority_score DESC NULLS LAST
+        ORDER BY pr.local_priority_score DESC NULLS LAST
     """
     if args.limit:
         sql += f" LIMIT {args.limit}"
@@ -466,7 +466,7 @@ if __name__ == "__main__":
                         help="Parallel workers (use 1 for safety)")
     parser.add_argument("--ecosystem",    type=str,   default=None,
                         help="Filter to one ecosystem (npm, pip, …)")
-    parser.add_argument("--timeout",      type=int,   default=C.EXEC_TIMEOUT,
+    parser.add_argument("--timeout",      type=int,   default=C.EXEC_TIMEOUT_TOTAL,
                         help="Per-stage timeout in seconds")
     parser.add_argument("--dry-run",      action="store_true")
     parser.add_argument("--resume",       action="store_true",
@@ -476,5 +476,5 @@ if __name__ == "__main__":
     parser.add_argument("--max-per-repo", type=int,   default=C.MAX_PRS_PER_REPO,
                         help="Max PRs per repository")
     args = parser.parse_args()
-    C.EXEC_TIMEOUT = args.timeout
+    C.EXEC_TIMEOUT_TOTAL = args.timeout
     main(args)

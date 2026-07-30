@@ -40,3 +40,6 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# AI conversation history
+**/CONVERSATION_HISTORY.md

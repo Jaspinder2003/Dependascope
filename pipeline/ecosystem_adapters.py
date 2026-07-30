@@ -93,6 +93,25 @@ def _workflow_commands(wf_path: Path) -> list[str]:
 
 # ─── npm adapter ──────────────────────────────────────────────────────────────
 
+# Common subdirectory names where JS code lives in non-JS-primary repos
+_NPM_SUBDIR_CANDIDATES = [
+    "client", "frontend", "app/javascript", "app/assets/javascripts",
+    "web", "ui", "static", "assets", "src",
+]
+
+
+def _find_npm_root(repo_root: Path) -> Path:
+    """Return the directory that actually contains package.json.
+    Checks repo root first, then common JS subdirectories."""
+    if (repo_root / "package.json").exists():
+        return repo_root
+    for subdir in _NPM_SUBDIR_CANDIDATES:
+        candidate = repo_root / subdir
+        if (candidate / "package.json").exists():
+            return candidate
+    return repo_root  # fall back to root even if not found
+
+
 def plan_npm(repo_root: Path) -> ExecutionPlan:
     plan = ExecutionPlan(ecosystem="npm", runtime_version=None, runtime_source="default")
     node_version = None
@@ -105,22 +124,37 @@ def plan_npm(repo_root: Path) -> ExecutionPlan:
         if cmds:
             plan.notes.append(f"CI commands from {wf.name}: {cmds[:5]}")
 
+    # Find the actual JS root (may be a subdirectory for mixed-language repos)
+    js_root = _find_npm_root(repo_root)
+    pkg_json = js_root / "package.json"
+    if not pkg_json.exists():
+        # No package.json anywhere — mark as unrunnable by returning empty plan
+        plan.notes.append("No package.json found at root or common subdirs")
+        return plan
+
+    if js_root != repo_root:
+        plan.notes.append(f"package.json found in subdirectory: {js_root.name}")
+        plan.runtime_source = f"subdir:{js_root.name}"
+
     # Read package.json scripts
-    pkg_json = repo_root / "package.json"
     test_script = None
     build_script = None
-    if pkg_json.exists():
-        try:
-            pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
-            scripts = pkg.get("scripts") or {}
-            test_script  = scripts.get("test")
-            build_script = scripts.get("build") or scripts.get("compile")
-        except Exception:
-            pass
+    try:
+        pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+        scripts = pkg.get("scripts") or {}
+        test_script  = scripts.get("test")
+        build_script = scripts.get("build") or scripts.get("compile")
+        # Skip repos whose test script is literally just an error placeholder
+        if test_script and 'no test specified' in test_script.lower():
+            test_script = None
+    except Exception:
+        pass
 
     # Node version fallback from .nvmrc / .node-version
     for nvf in [".nvmrc", ".node-version"]:
-        nvpath = repo_root / nvf
+        nvpath = js_root / nvf
+        if not nvpath.exists():
+            nvpath = repo_root / nvf
         if nvpath.exists():
             node_version = _read_text(nvpath).strip()
             plan.runtime_source = nvf
@@ -128,25 +162,40 @@ def plan_npm(repo_root: Path) -> ExecutionPlan:
 
     plan.runtime_version = node_version or "lts"
 
-    # Choose install command
-    if (repo_root / "pnpm-lock.yaml").exists():
+    # Choose install command — prefer yarn if yarn.lock exists AND yarn is available
+    # Fall back to npm install --legacy-peer-deps if yarn not found
+    import shutil
+    if (js_root / "pnpm-lock.yaml").exists():
         install_cmd = "pnpm install --frozen-lockfile"
-    elif (repo_root / "yarn.lock").exists():
-        install_cmd = "yarn install --frozen-lockfile"
-    elif (repo_root / "package-lock.json").exists():
-        install_cmd = "npm ci"
+    elif (js_root / "yarn.lock").exists():
+        if shutil.which("yarn"):
+            install_cmd = "yarn install --frozen-lockfile"
+        else:
+            # yarn.lock present but yarn not installed: use npm with legacy deps
+            install_cmd = "npm install --legacy-peer-deps"
+            plan.notes.append("yarn.lock found but yarn not installed; using npm install")
+    elif (js_root / "package-lock.json").exists():
+        install_cmd = "npm ci --legacy-peer-deps"
     else:
-        install_cmd = "npm install"
+        install_cmd = "npm install --legacy-peer-deps"
+
+    # If JS is in a subdirectory, prefix commands with cd into that subdir
+    if js_root != repo_root:
+        rel = js_root.relative_to(repo_root).as_posix()
+        def _prefix(cmd: str) -> str:
+            return f"cd {rel} && {cmd}"
+    else:
+        def _prefix(cmd: str) -> str:
+            return cmd
 
     plan.stages = [
-        Stage("INSTALL", install_cmd, "package_manager_detection", "high"),
+        Stage("INSTALL", _prefix(install_cmd), "package_manager_detection", "high"),
     ]
-    if build_script:
-        plan.stages.append(Stage("BUILD", f"npm run build", "package_json_scripts", "medium"))
+    # Skip BUILD — build tools (vsce, webpack, esbuild CLI, etc.) are rarely installed
+    # globally and cause false FAIL->FAIL noise. The research signal is at INSTALL and TEST.
     if test_script:
-        plan.stages.append(Stage("TEST", f"npm test", "package_json_scripts", "high"))
-    else:
-        plan.stages.append(Stage("TEST", "npm test", "default_npm", "low"))
+        plan.stages.append(Stage("TEST", _prefix("npm test"), "package_json_scripts", "high"))
+    # Don't add a test stage if there's no real test script — avoids guaranteed failures
 
     return plan
 
@@ -204,6 +253,18 @@ def plan_pip(repo_root: Path) -> ExecutionPlan:
 
 # ─── Maven adapter ────────────────────────────────────────────────────────────
 
+def _find_pom_root(repo_root: Path) -> Path:
+    """Return the directory containing pom.xml, searching root then one level deep."""
+    if (repo_root / "pom.xml").exists():
+        return repo_root
+    # Search one level of subdirectories
+    for child in sorted(repo_root.iterdir()):
+        if child.is_dir() and not child.name.startswith("."):
+            if (child / "pom.xml").exists():
+                return child
+    return repo_root  # fall back even if not found
+
+
 def plan_maven(repo_root: Path) -> ExecutionPlan:
     plan = ExecutionPlan(ecosystem="maven", runtime_version=None, runtime_source="default")
     java_version = None
@@ -213,10 +274,26 @@ def plan_maven(repo_root: Path) -> ExecutionPlan:
         java_version = java_version or _extract_java_version(text)
 
     plan.runtime_version = java_version or "11"
+
+    # Find where pom.xml actually lives
+    mvn_root = _find_pom_root(repo_root)
+    if not (mvn_root / "pom.xml").exists():
+        plan.notes.append("No pom.xml found at root or immediate subdirectories")
+        return plan  # empty stages = UNRUNNABLE
+
+    if mvn_root != repo_root:
+        rel = mvn_root.relative_to(repo_root).as_posix()
+        plan.notes.append(f"pom.xml found in subdirectory: {rel}")
+        def _mvn(cmd: str) -> str:
+            return f"cd {rel} && {cmd}"
+    else:
+        def _mvn(cmd: str) -> str:
+            return cmd
+
     plan.stages = [
-        Stage("INSTALL", "mvn dependency:resolve -q", "maven_default", "high"),
-        Stage("BUILD",   "mvn compile -q",            "maven_default", "high"),
-        Stage("TEST",    "mvn test -q",               "maven_default", "high"),
+        Stage("INSTALL", _mvn("mvn dependency:resolve -q --no-transfer-progress"), "maven_default", "high"),
+        Stage("BUILD",   _mvn("mvn compile -q --no-transfer-progress"),            "maven_default", "high"),
+        Stage("TEST",    _mvn("mvn test -q --no-transfer-progress"),               "maven_default", "high"),
     ]
     return plan
 
@@ -314,9 +391,37 @@ _ADAPTERS = {
     "gem":           plan_gem,
 }
 
+# Ordered by priority — check more specific files first
+_AUTO_DETECT = [
+    ("package.json",       "npm"),
+    ("pom.xml",            "maven"),
+    ("build.gradle",       "gradle"),
+    ("build.gradle.kts",   "gradle"),
+    ("requirements.txt",   "pip"),
+    ("pyproject.toml",     "pip"),
+    ("setup.py",           "pip"),
+    ("Pipfile",            "pip"),
+    ("Gemfile",            "gem"),
+    ("go.mod",             "go"),
+    ("Cargo.toml",         "cargo"),
+    ("composer.json",      "composer"),
+]
+
+
+def detect_ecosystem(repo_root: Path) -> Optional[str]:
+    """Auto-detect ecosystem from manifest files on disk."""
+    for filename, eco in _AUTO_DETECT:
+        if (repo_root / filename).exists():
+            return eco
+    return None
+
 
 def get_execution_plan(ecosystem: str, repo_root: Path) -> Optional[ExecutionPlan]:
-    adapter = _ADAPTERS.get((ecosystem or "").lower())
+    eco = (ecosystem or "").lower()
+    # Auto-detect if unknown
+    if eco in ("", "unknown", "none"):
+        eco = detect_ecosystem(repo_root) or ""
+    adapter = _ADAPTERS.get(eco)
     if adapter is None:
         return None
     try:

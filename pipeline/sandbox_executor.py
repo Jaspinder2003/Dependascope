@@ -53,9 +53,25 @@ def _safe_env() -> dict:
         if "TOKEN" in k.upper() or "SECRET" in k.upper() or "PASSWORD" in k.upper():
             continue
         env[k] = v
-    # Add minimal required variables
-    env.setdefault("PATH", os.environ.get("PATH", ""))
+
+    # Explicitly prepend Python 3.9 Conda environment to PATH
+    conda_env_dir = r"C:\Users\jaspi\anaconda3\envs\diagnosis"
+    conda_paths = [
+        conda_env_dir,
+        os.path.join(conda_env_dir, "Scripts"),
+        os.path.join(conda_env_dir, "Library", "bin"),
+        r"C:\tools\maven\bin",
+    ]
+    existing_path = os.environ.get("PATH", "")
+    new_path = ";".join(conda_paths) + ";" + existing_path
+    env["PATH"] = new_path
+
     env.setdefault("HOME", os.environ.get("HOME", str(Path.home())))
+    # CI mode: prevents Jest/React/Angular from running in interactive watch mode
+    env["CI"] = "true"
+    env["NODE_ENV"] = "test"
+    # Avoid npm update checks slowing things down
+    env["NO_UPDATE_NOTIFIER"] = "1"
     return env
 
 
@@ -65,7 +81,7 @@ def run_stage(
     work_dir: Path,
     stdout_path: Path,
     stderr_path: Path,
-    timeout: int = C.EXEC_TIMEOUT,
+    timeout: int = C.EXEC_TIMEOUT_TOTAL,
 ) -> dict:
     """
     Execute a single stage command. Returns a result dict:
@@ -80,18 +96,33 @@ def run_stage(
 
     try:
         with open(stdout_path, "wb") as fout, open(stderr_path, "wb") as ferr:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(work_dir),
                 stdout=fout,
                 stderr=ferr,
                 env=env,
-                timeout=timeout,
             )
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
+            try:
+                proc.communicate(timeout=timeout)
+                exit_code = proc.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                # On Windows, kill the ENTIRE process tree (pip/mvn orphans survive
+                # a plain proc.kill() because shell=True spawns cmd.exe as parent)
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        capture_output=True,
+                    )
+                else:
+                    try:
+                        import signal, os as _os
+                        _os.killpg(_os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+                proc.communicate()  # reap zombie
     except Exception as e:
         try:
             stderr_path.write_bytes(str(e).encode())
@@ -151,7 +182,7 @@ def run_plan(
             work_dir=work_dir,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
-            timeout=min(stage.timeout, C.EXEC_TIMEOUT),
+            timeout=min(stage.timeout, C.EXEC_TIMEOUT_TOTAL),
         )
         stage_results.append(result)
 

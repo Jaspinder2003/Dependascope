@@ -44,7 +44,7 @@ def score_pr(pr: dict) -> tuple[float, list[str]]:
     """
     score  = 0.0
     reasons = []
-    W = C.PRIORITY_WEIGHTS
+    W = C.LOCAL_SCORE
 
     # CI failure signal
     # Check changed_files for CI columns not easily available here;
@@ -54,18 +54,18 @@ def score_pr(pr: dict) -> tuple[float, list[str]]:
     state    = (pr.get("state") or "").lower()
     merged_at = pr.get("merged_at") or ""
     if state == "closed" and not merged_at:
-        score += W["closed_without_merge"]
+        score += W["closed_not_merged"]
         reasons.append("closed_not_merged")
 
     # Merged (lower failure chance)
     if merged_at:
-        score += W["merged_pr"]
+        score += 0
         reasons.append("merged")
 
     # Body/title failure keywords
     text = " ".join([pr.get("title") or "", pr.get("body") or ""])
     if _FAIL_KW_RE.search(text):
-        score += W["failure_keyword"]
+        score += 2
         reasons.append("failure_keyword_in_text")
 
     # Security label
@@ -75,7 +75,7 @@ def score_pr(pr: dict) -> tuple[float, list[str]]:
     except Exception:
         labels = []
     if any("security" in str(l).lower() for l in labels):
-        score += W["security_label"]
+        score += W["title_security_prefix"]
         reasons.append("security_label")
 
     # Major version bump
@@ -83,29 +83,38 @@ def score_pr(pr: dict) -> tuple[float, list[str]]:
     if dep_info:
         bump_type = dep_info.get("version_change_type", "")
         if bump_type == "major":
-            score += W["major_version_bump"]
+            score += W["major_bump"]
             reasons.append("major_version_bump")
-        if bump_type in ("minor", "patch"):
-            score += 1
-            reasons.append(f"{bump_type}_bump")
+        if bump_type == "minor":
+            score += W["minor_bump"]
+            reasons.append("minor_bump")
+        if bump_type == "patch":
+            score += W["patch_bump"]
+            reasons.append("patch_bump")
 
     # Ecosystem supported
     eco = (pr.get("ecosystem") or "").lower()
     if eco in SUPPORTED_ECOSYSTEMS:
-        score += W["ecosystem_supported"]
+        score += W["supported_ecosystem"]
         reasons.append(f"supported_ecosystem:{eco}")
 
     # Has comments (discussion may indicate problems)
     comments = pr.get("comments_count") or 0
     if comments > 0:
-        score += W["has_review_comment"]
+        score += W["has_comments"]
         reasons.append(f"has_comments:{comments}")
+    if comments >= 3:
+        score += W["many_comments"]
+        reasons.append("many_comments")
 
     # Changed files count – single file is clean
     changed = pr.get("changed_files") or 0
     if 1 <= changed <= 3:
-        score += 1
+        score += W["files_lte3"]
         reasons.append("small_diff")
+    if changed == 1:
+        score += W["files_eq1"]
+        reasons.append("single_file")
 
     return score, reasons
 
@@ -143,7 +152,7 @@ def main(args: argparse.Namespace) -> None:
     for score, reasons, pr_dict in scored:
         if not args.dry_run:
             conn.execute(
-                "UPDATE pull_requests SET priority_score=?, processing_status='QUEUED' "
+                "UPDATE pull_requests SET local_priority_score=?, processing_status='QUEUED' "
                 "WHERE repo=? AND pr_number=?",
                 (score, pr_dict["repo"], pr_dict["pr_number"])
             )

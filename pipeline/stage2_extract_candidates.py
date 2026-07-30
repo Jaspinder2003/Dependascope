@@ -174,7 +174,7 @@ def pr_row_from_xlsx(headers: list, values: tuple, source_file: str, source_data
         "additions":        _safe_int(row.get("Additions")),
         "deletions":        _safe_int(row.get("Deletions")),
         "changed_files":    _safe_int(row.get("Changed_files")),
-        "priority_score":   None,
+        "local_priority_score": None,
         "strict_or_complex": strict_or_complex,
         "classification_reason": reason,
         "processing_status": "PENDING",
@@ -243,7 +243,7 @@ def pr_row_from_json_item(item: dict, source_file: str) -> Optional[dict]:
         "additions":         None,
         "deletions":         None,
         "changed_files":     None,
-        "priority_score":    None,
+        "local_priority_score": None,
         "strict_or_complex": strict_or_complex,
         "classification_reason": reason,
         "processing_status": "PENDING",
@@ -324,10 +324,15 @@ def main(args: argparse.Namespace) -> None:
     total    = 0
 
     limit = args.limit
+    source = args.source  # None = all, 'p1' = partition1 only, 'p2' = partition2 only, 'p2json' = JSON only
+
+    use_p1    = source in (None, "p1", "all")
+    use_p2xlsx = source in (None, "p2", "all")
+    use_p2json = source in (None, "p2", "p2json", "all")
 
     # ── Source 1: Partition 1 PRs.xlsx ────────────────────────────────────────
     p1_prs = C.PARTITION1 / "PRs.xlsx"
-    if p1_prs.exists():
+    if use_p1 and p1_prs.exists():
         logger.info(f"Reading {p1_prs.name} ...")
         for i, (headers, row) in enumerate(stream_xlsx(p1_prs, max_rows=limit)):
             total += 1
@@ -353,7 +358,7 @@ def main(args: argparse.Namespace) -> None:
 
     # ── Source 2: Partition 2 PRs.xlsx ────────────────────────────────────────
     p2_prs = C.PARTITION2 / "PRs.xlsx"
-    if p2_prs.exists() and (not limit or inserted < limit):
+    if use_p2xlsx and p2_prs.exists() and (not limit or inserted < limit):
         logger.info(f"Reading {p2_prs.name} ...")
         p2_inserted = 0
         for headers, row in stream_xlsx(p2_prs, max_rows=limit):
@@ -370,7 +375,7 @@ def main(args: argparse.Namespace) -> None:
 
     # ── Source 3: Partition 2 JSON directory ──────────────────────────────────
     json_dir = C.PARTITION2 / "Dataset" / "Dependabot"
-    if json_dir.exists() and (not limit or inserted < limit):
+    if use_p2json and json_dir.exists() and (not limit or inserted < limit):
         logger.info("Reading Partition 2 JSON directory ...")
         json_inserted = 0
         json_total    = 0
@@ -446,5 +451,17 @@ if __name__ == "__main__":
                         help="Skip Parquet export")
     parser.add_argument("--resume", action="store_true",
                         help="(no-op in this stage; DB upsert handles resumption)")
+    parser.add_argument(
+        "--source",
+        choices=["all", "p1", "p2", "p2json"],
+        default=None,
+        help=(
+            "Which data source to load. "
+            "'p1' = Partition 1 xlsx only (2018-2019, old). "
+            "'p2' = Partition 2 xlsx + JSON (2021-2023, newer). "
+            "'p2json' = Partition 2 JSON only (2021-2023, recommended). "
+            "Default: all sources."
+        )
+    )
     args = parser.parse_args()
     main(args)

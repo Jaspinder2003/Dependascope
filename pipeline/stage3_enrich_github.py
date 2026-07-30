@@ -183,7 +183,7 @@ def main(args: argparse.Namespace) -> None:
     sql = f"""
         SELECT repo, pr_number FROM pull_requests
         WHERE processing_status IN ({placeholders})
-        ORDER BY priority_score DESC NULLS LAST
+        ORDER BY local_priority_score DESC NULLS LAST
     """
     if args.limit:
         sql += f" LIMIT {args.limit}"
@@ -199,7 +199,7 @@ def main(args: argparse.Namespace) -> None:
         repo     = row["repo"]
         pr_num   = row["pr_number"]
 
-        if args.only_repo and not repo.startswith(args.only_repo):
+        if getattr(args, 'only_repo', None) and not repo.startswith(args.only_repo):
             continue
 
         try:
@@ -266,7 +266,7 @@ def _is_source(fname: str) -> int:
 
 def _is_test(fname: str) -> int:
     fl = fname.lower()
-    for pat in C.TEST_PATH_PATTERNS:
+    for pat in C.TEST_PATH_FRAGMENTS:
         if pat in fl:
             return 1
     return 0
@@ -274,7 +274,7 @@ def _is_test(fname: str) -> int:
 
 def _is_ci(fname: str) -> int:
     fl = fname.lower()
-    for pat in C.CI_PATH_PATTERNS:
+    for pat in C.CI_PATH_PREFIXES:
         if fl.startswith(pat) or pat in fl:
             return 1
     return 0
