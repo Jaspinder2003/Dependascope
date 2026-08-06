@@ -1,6 +1,6 @@
 """
-smart_run.py — Resumable two-phase Dependabot reproduction runner
-═════════════════════════════════════════════════════════════════════
+smart_run.py ΓÇö Resumable two-phase Dependabot reproduction runner
+ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
 Supports two independent modes that can run in parallel terminals:
 
   Terminal 1:  python smart_run.py probe --target 1000
@@ -35,13 +35,30 @@ import sandbox_executor as sx
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s ΓÇô %(message)s",
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger("smart_run")
 
 
-# ─────────────────────────── Probe helper ───────────────────────────
+def db_write(conn, sql, params=(), retries=5, base_delay=1.0):
+    """Execute a write with retry-on-lock to handle concurrent access."""
+    for attempt in range(retries):
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"DB locked, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
+                time.sleep(delay)
+            else:
+                raise
+
+
+
+# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ Probe helper ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def quick_install_test(repo: str, head_sha: str, before_sha: str, pr_number: int, timeout: int = 180) -> tuple[bool, str]:
     """
@@ -90,7 +107,10 @@ def quick_install_test(repo: str, head_sha: str, before_sha: str, pr_number: int
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
             else:
                 proc.kill()
-            proc.communicate()
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
             return False, "install_timeout"
     finally:
         try:
@@ -99,7 +119,7 @@ def quick_install_test(repo: str, head_sha: str, before_sha: str, pr_number: int
             pass
 
 
-# ──────────────────────── Full reproduce helper ─────────────────────
+# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ Full reproduce helper ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 def full_reproduce(conn, row, attempt=1):
     """Run the full BEFORE/AFTER comparison for a single PR."""
@@ -160,21 +180,33 @@ def full_reproduce(conn, row, attempt=1):
     else:
         classification = "FAIL->FAIL"
 
-    conn.execute("""
+    db_write(conn, """
         INSERT OR REPLACE INTO final_results
         (repo, pr_number, ecosystem, before_result, after_result, classification)
         VALUES (?,?,?,?,?,?)
     """, (repo, pr_number, ecosystem, before_r, after_r, classification))
-    conn.execute("""
+    db_write(conn, """
         UPDATE pull_requests SET processing_status='DONE'
         WHERE repo=? AND pr_number=?
     """, (repo, pr_number))
-    conn.commit()
+
+    # Automatically refresh export CSV whenever a PASS->FAIL or PASS->PASS is classified
+    if classification in ("PASS->FAIL", "PASS->PASS"):
+        try:
+            export_script = Path(__file__).parent / "export_data_sample.py"
+            if export_script.exists():
+                subprocess.run([sys.executable, str(export_script)], capture_output=True)
+                out_csv = Path("C:/depbot-work/output/dependabot_research_sample.csv")
+                root_csv = C.DATA_DIR / "dependabot_research_sample.csv"
+                if out_csv.exists():
+                    shutil.copy(out_csv, root_csv)
+        except Exception as e:
+            logger.warning(f"Could not auto-update export CSV: {e}")
 
     return classification
 
 
-# ═══════════════════════════ PROBE command ═══════════════════════════
+# ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ PROBE command ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
 
 def cmd_probe(args):
     """Phase 1: Probe candidate PRs for installability. Marks them PROBED_OK or PROBED_FAIL."""
@@ -224,13 +256,11 @@ def cmd_probe(args):
             if ok:
                 ok_count += 1
                 logger.info(f"    >> INSTALL OK -- queued for full run ({ok_count}/{args.target})")
-                conn.execute("UPDATE pull_requests SET processing_status='PROBED_OK' WHERE repo=? AND pr_number=?", (repo, pr_number))
-                conn.commit()
+                db_write(conn, "UPDATE pull_requests SET processing_status='PROBED_OK' WHERE repo=? AND pr_number=?", (repo, pr_number))
             else:
                 skip_count += 1
                 logger.info(f"    x  Skip: {reason}")
-                conn.execute("UPDATE pull_requests SET processing_status='PROBED_FAIL' WHERE repo=? AND pr_number=?", (repo, pr_number))
-                conn.commit()
+                db_write(conn, "UPDATE pull_requests SET processing_status='PROBED_FAIL' WHERE repo=? AND pr_number=?", (repo, pr_number))
 
             if ok_count >= args.target:
                 logger.info(f"Reached target of {args.target} new installable repos!")
@@ -251,7 +281,7 @@ def cmd_probe(args):
     logger.info("Now run in another terminal:  python smart_run.py run")
 
 
-# ════════════════════════════ RUN command ════════════════════════════
+# ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ RUN command ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
 
 def cmd_run(args):
     """Phase 2: Pick PROBED_OK repos from DB and run full BEFORE/AFTER. Marks DONE when finished."""
@@ -312,7 +342,7 @@ def cmd_run(args):
     logger.info(f"{'='*60}")
 
 
-# ═══════════════════════════ STATUS command ══════════════════════════
+# ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ STATUS command ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
 
 def cmd_status(args):
     """Print current pipeline status."""
@@ -343,7 +373,7 @@ def cmd_status(args):
     conn.close()
 
 
-# ═══════════════════════════ CLI ENTRYPOINT ══════════════════════════
+# ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ CLI ENTRYPOINT ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
 
 def main():
     parser = argparse.ArgumentParser(

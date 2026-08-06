@@ -62,6 +62,11 @@ def process_pr_item(conn, item: dict) -> bool:
     repo_full = m.group(1)
     pr_number = int(m.group(2))
 
+    # Fast skip: If PR already exists in SQLite, don't waste API calls on it
+    existing = conn.execute("SELECT 1 FROM pull_requests WHERE repo=? AND pr_number=?", (repo_full, pr_number)).fetchone()
+    if existing:
+        return False
+
     owner, repo_name = repo_full.split("/", 1)
 
     # Fetch full PR object to get SHAs
@@ -153,7 +158,7 @@ def process_pr_item(conn, item: dict) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch fresh Dependabot PRs from GitHub API")
-    parser.add_argument("--query", type=str, default="is:pr author:app/dependabot is:closed is:unmerged",
+    parser.add_argument("--query", type=str, default="is:pr author:app/dependabot is:closed is:unmerged status:failure",
                         help="GitHub search query")
     parser.add_argument("--limit", type=int, default=100, help="Max PRs to fetch & process")
     parser.add_argument("--ecosystem", type=str, choices=["npm", "pip", "maven", "gradle", "gem", "all"], default="all")
@@ -168,27 +173,39 @@ def main():
         search = rl.get("resources", {}).get("search", {})
         logger.info(f"API Rate limit — Core: {core.get('remaining')}/{core.get('limit')}, Search: {search.get('remaining')}/{search.get('limit')}")
 
-    # Refine search query with ecosystem label if specified
-    search_q = args.query
-    if args.ecosystem != "all":
-        search_q += f" label:{args.ecosystem}"
+    # Build search queries across ecosystems if 'all' is specified
+    queries = []
+    if args.ecosystem == "all":
+        queries.append(args.query)
+        for eco in ["npm", "pip", "maven", "gradle", "cargo", "go"]:
+            queries.append(f"{args.query} label:{eco}")
+    else:
+        queries.append(f"{args.query} label:{args.ecosystem}")
 
-    logger.info(f"Searching GitHub PRs: '{search_q}' (limit={args.limit})...")
-    items = search_dependabot_prs(conn, search_q, max_pages=max(1, args.limit // 100))
-
-    logger.info(f"Processing {len(items[:args.limit])} search results...")
     success = 0
-    for i, item in enumerate(items[:args.limit]):
-        if process_pr_item(conn, item):
-            success += 1
-        if (i + 1) % 10 == 0:
-            conn.commit()
-            logger.info(f"  Processed {i+1}/{min(len(items), args.limit)} | Inserted: {success}")
+    total_scanned = 0
+
+    for search_q in queries:
+        if success >= args.limit:
+            break
+
+        logger.info(f"Searching GitHub PRs: '{search_q}' (target remaining={args.limit - success})...")
+        items = search_dependabot_prs(conn, search_q, max_pages=10)
+        total_scanned += len(items)
+
+        for item in items:
+            if success >= args.limit:
+                break
+            if process_pr_item(conn, item):
+                success += 1
+                if success % 10 == 0:
+                    conn.commit()
+                    logger.info(f"  Inserted new candidate #{success}/{args.limit}")
 
     conn.commit()
     conn.close()
 
-    print(f"\nLive GitHub fetch complete! {success} fresh Dependabot PRs saved in {C.DB_PATH}")
+    print(f"\nLive GitHub fetch complete! {success} NEW fresh Dependabot PRs saved in {C.DB_PATH} (scanned {total_scanned} search items)")
 
 
 if __name__ == "__main__":

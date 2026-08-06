@@ -218,8 +218,8 @@ CREATE INDEX IF NOT EXISTS idx_comments_rp  ON pr_comments(repo, pr_number);
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
-    """Return a WAL-mode SQLite connection."""
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    """Return a WAL-mode SQLite connection with 60s lock timeout."""
+    conn = sqlite3.connect(str(db_path), timeout=60.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -245,7 +245,10 @@ def upsert_pr(conn: sqlite3.Connection, row: dict) -> None:
     placeholders = ", ".join("?" for _ in cols)
     col_names    = ", ".join(cols)
     pk = {"repo", "pr_number"}
-    update_clause = ", ".join(f"{c}=excluded.{c}" for c in cols if c not in pk)
+    # Never overwrite processing_status — once a PR is DONE/PROBED_OK/PROBED_FAIL
+    # it must stay that way; re-fetching from GitHub must not reset it.
+    protected = pk | {"processing_status"}
+    update_clause = ", ".join(f"{c}=excluded.{c}" for c in cols if c not in protected)
     sql = (
         f"INSERT INTO pull_requests ({col_names}) VALUES ({placeholders})"
         + (f" ON CONFLICT(repo, pr_number) DO UPDATE SET {update_clause}" if update_clause else

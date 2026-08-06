@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 def _run(cmd: list[str], cwd: Optional[Path] = None,
          timeout: int = C.GIT_FETCH_TIMEOUT) -> tuple[int, str, str]:
     """Run a subprocess command. Returns (returncode, stdout, stderr)."""
+    import os
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
     try:
         result = subprocess.run(
             cmd,
@@ -31,6 +35,7 @@ def _run(cmd: list[str], cwd: Optional[Path] = None,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:

@@ -70,8 +70,9 @@ def _safe_env() -> dict:
     # CI mode: prevents Jest/React/Angular from running in interactive watch mode
     env["CI"] = "true"
     env["NODE_ENV"] = "test"
-    # Avoid npm update checks slowing things down
-    env["NO_UPDATE_NOTIFIER"] = "1"
+    # Non-interactive execution flags: prevent hanging on terminal prompts
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["PIP_NO_INPUT"] = "1"
     return env
 
 
@@ -122,7 +123,10 @@ def run_stage(
                         _os.killpg(_os.getpgid(proc.pid), signal.SIGKILL)
                     except Exception:
                         proc.kill()
-                proc.communicate()  # reap zombie
+                try:
+                    proc.communicate(timeout=5)  # reap zombie without blocking forever
+                except Exception:
+                    pass
     except Exception as e:
         try:
             stderr_path.write_bytes(str(e).encode())
