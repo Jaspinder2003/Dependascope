@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS final_results (
     network_policy        TEXT,
     log_paths             TEXT,   -- JSON list
     notes                 TEXT,
+    duration_seconds      REAL,
     created_at            TEXT DEFAULT (datetime('now')),
     PRIMARY KEY (repo, pr_number)
 );
@@ -234,6 +235,17 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.executescript(DDL)
     conn.executescript(INDICES)
     conn.commit()
+
+    # Migration: Ensure duration_seconds column exists in final_results
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(final_results)").fetchall()]
+        if "duration_seconds" not in cols:
+            conn.execute("ALTER TABLE final_results ADD COLUMN duration_seconds REAL")
+            conn.commit()
+            logger.info("Migrated final_results table: added duration_seconds column")
+    except Exception as e:
+        logger.warning(f"Could not check/migrate duration_seconds column: {e}")
+
     logger.info("Database initialized at %s", db_path)
     return conn
 

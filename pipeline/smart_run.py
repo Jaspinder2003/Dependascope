@@ -123,6 +123,7 @@ def quick_install_test(repo: str, head_sha: str, before_sha: str, pr_number: int
 
 def full_reproduce(conn, row, attempt=1):
     """Run the full BEFORE/AFTER comparison for a single PR."""
+    start_time = time.time()
     repo = row["repo"]
     pr_number = row["pr_number"]
     ecosystem = row["ecosystem"] or "unknown"
@@ -180,11 +181,13 @@ def full_reproduce(conn, row, attempt=1):
     else:
         classification = "FAIL->FAIL"
 
+    total_duration = round(time.time() - start_time, 2)
+
     db_write(conn, """
         INSERT OR REPLACE INTO final_results
-        (repo, pr_number, ecosystem, before_result, after_result, classification)
-        VALUES (?,?,?,?,?,?)
-    """, (repo, pr_number, ecosystem, before_r, after_r, classification))
+        (repo, pr_number, ecosystem, before_result, after_result, classification, duration_seconds)
+        VALUES (?,?,?,?,?,?,?)
+    """, (repo, pr_number, ecosystem, before_r, after_r, classification, total_duration))
     db_write(conn, """
         UPDATE pull_requests SET processing_status='DONE'
         WHERE repo=? AND pr_number=?
