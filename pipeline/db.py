@@ -252,6 +252,22 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 # ─── Upsert helpers ───────────────────────────────────────────────────────────
 
+def safe_execute_write(conn: sqlite3.Connection, sql: str, params: tuple = (), retries: int = 5, base_delay: float = 1.0) -> None:
+    """Execute a write query with lock retry exponential backoff."""
+    import time
+    for attempt in range(retries):
+        try:
+            conn.execute(sql, params)
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Database locked in write execution, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
+                time.sleep(delay)
+            else:
+                raise
+
+
 def upsert_pr(conn: sqlite3.Connection, row: dict) -> None:
     cols = list(row.keys())
     placeholders = ", ".join("?" for _ in cols)
@@ -266,7 +282,7 @@ def upsert_pr(conn: sqlite3.Connection, row: dict) -> None:
         + (f" ON CONFLICT(repo, pr_number) DO UPDATE SET {update_clause}" if update_clause else
            " ON CONFLICT(repo, pr_number) DO NOTHING")
     )
-    conn.execute(sql, [row[c] for c in cols])
+    safe_execute_write(conn, sql, [row[c] for c in cols])
 
 
 def upsert_dep_change(conn: sqlite3.Connection, row: dict) -> None:
@@ -279,26 +295,25 @@ def upsert_dep_change(conn: sqlite3.Connection, row: dict) -> None:
         f"INSERT INTO dependency_changes ({col_names}) VALUES ({placeholders})"
         f" ON CONFLICT(repo, pr_number, manifest_path, dependency) DO UPDATE SET {update_clause}"
     )
-    conn.execute(sql, [row[c] for c in cols])
+    safe_execute_write(conn, sql, [row[c] for c in cols])
 
 
 def upsert_manifest_content(conn: sqlite3.Connection, repo: str, pr_number: int,
                              snapshot: str, manifest_path: str, content: str,
                              fetch_method: str) -> None:
-    conn.execute(
-        """INSERT INTO manifest_contents
+    sql = """INSERT INTO manifest_contents
            (repo, pr_number, snapshot, manifest_path, content, fetch_method)
            VALUES (?,?,?,?,?,?)
            ON CONFLICT(repo, pr_number, snapshot, manifest_path)
            DO UPDATE SET content=excluded.content, fetch_method=excluded.fetch_method,
-                         fetched_at=datetime('now')""",
-        (repo, pr_number, snapshot, manifest_path, content, fetch_method)
-    )
+                         fetched_at=datetime('now')"""
+    safe_execute_write(conn, sql, (repo, pr_number, snapshot, manifest_path, content, fetch_method))
 
 
 def log_event(conn: sqlite3.Connection, repo: str, pr_number: Optional[int],
               stage: str, message: str, level: str = "INFO") -> None:
-    conn.execute(
+    safe_execute_write(
+        conn,
         "INSERT INTO processing_log (repo, pr_number, stage, message, level) VALUES (?,?,?,?,?)",
         (repo, pr_number, stage, message, level)
     )
@@ -315,13 +330,11 @@ def cache_get(conn: sqlite3.Connection, key: str) -> Optional[Any]:
 
 
 def cache_set(conn: sqlite3.Connection, key: str, data: Any, status_code: int = 200) -> None:
-    conn.execute(
-        """INSERT INTO github_cache (cache_key, response_body, status_code)
+    sql = """INSERT INTO github_cache (cache_key, response_body, status_code)
            VALUES (?,?,?)
            ON CONFLICT(cache_key) DO UPDATE SET response_body=excluded.response_body,
-           cached_at=datetime('now'), status_code=excluded.status_code""",
-        (key, json.dumps(data, default=str), status_code)
-    )
+           cached_at=datetime('now'), status_code=excluded.status_code"""
+    safe_execute_write(conn, sql, (key, json.dumps(data, default=str), status_code))
 
 
 # ─── Gate helpers ─────────────────────────────────────────────────────────────

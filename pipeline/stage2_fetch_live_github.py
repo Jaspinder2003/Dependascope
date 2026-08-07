@@ -173,9 +173,18 @@ def main():
         search = rl.get("resources", {}).get("search", {})
         logger.info(f"API Rate limit — Core: {core.get('remaining')}/{core.get('limit')}, Search: {search.get('remaining')}/{search.get('limit')}")
 
-    # Build search queries across ecosystems if 'all' is specified
+    # Build search queries across ecosystems or search term variations
     queries = []
-    if args.ecosystem == "all":
+    if args.ecosystem in ("pip", "python"):
+        queries.append(f"{args.query} label:pip")
+        queries.append(f"{args.query} label:python")
+        queries.append(f"{args.query} requirements.txt")
+        queries.append(f"{args.query} pyproject.toml")
+        queries.append(f"{args.query} poetry")
+        queries.append(f"{args.query} pytest")
+        queries.append(f"{args.query} Pipfile")
+        queries.append(f"{args.query} setup.py")
+    elif args.ecosystem == "all":
         queries.append(args.query)
         for eco in ["npm", "pip", "maven", "gradle", "cargo", "go"]:
             queries.append(f"{args.query} label:{eco}")

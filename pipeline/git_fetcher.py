@@ -69,6 +69,14 @@ def clone_or_update(repo: str, head_sha: str, before_sha: Optional[str],
             return False, f"git init failed: {err}"
         _run(["git", "-C", str(cache), "remote", "add", "origin", clone_url])
 
+    # Clean up any stale shallow.lock left over from interrupted fetches
+    shallow_lock = cache / "shallow.lock"
+    if shallow_lock.exists():
+        try:
+            shallow_lock.unlink()
+        except Exception:
+            pass
+
     # ── Helper: check if a SHA is already present ─────────────────────────────
     def sha_present(sha: str) -> bool:
         rc, _, _ = _run(["git", "-C", str(cache), "cat-file", "-e", sha])

@@ -202,6 +202,25 @@ def plan_npm(repo_root: Path) -> ExecutionPlan:
 
 # ─── pip/Python adapter ───────────────────────────────────────────────────────
 
+_PYTHON_SUBDIR_CANDIDATES = [
+    "backend", "api", "server", "src", "app", "tools", "pipeline", "service", "python"
+]
+
+
+def _find_pip_root(repo_root: Path) -> Path:
+    """Return directory containing Python manifest (requirements.txt, pyproject.toml, etc.)."""
+    manifests = ["requirements.txt", "pyproject.toml", "setup.py", "Pipfile", "poetry.lock"]
+    for m in manifests:
+        if (repo_root / m).exists():
+            return repo_root
+    for subdir in _PYTHON_SUBDIR_CANDIDATES:
+        candidate = repo_root / subdir
+        for m in manifests:
+            if (candidate / m).exists():
+                return candidate
+    return repo_root
+
+
 def plan_pip(repo_root: Path) -> ExecutionPlan:
     plan = ExecutionPlan(ecosystem="pip", runtime_version=None, runtime_source="default")
     python_version = None
@@ -210,8 +229,12 @@ def plan_pip(repo_root: Path) -> ExecutionPlan:
         text = _read_text(wf)
         python_version = python_version or _extract_python_version(text)
 
+    py_root = _find_pip_root(repo_root)
+
     # .python-version
-    pv_file = repo_root / ".python-version"
+    pv_file = py_root / ".python-version"
+    if not pv_file.exists():
+        pv_file = repo_root / ".python-version"
     if pv_file.exists():
         python_version = _read_text(pv_file).strip()
         plan.runtime_source = ".python-version"
@@ -219,34 +242,45 @@ def plan_pip(repo_root: Path) -> ExecutionPlan:
     plan.runtime_version = python_version or "3.x"
 
     # Determine install command
-    if (repo_root / "poetry.lock").exists() or (repo_root / "pyproject.toml").exists():
-        install_cmd = "pip install poetry && poetry install --no-interaction"
-    elif (repo_root / "Pipfile.lock").exists():
+    if (py_root / "poetry.lock").exists() or (py_root / "pyproject.toml").exists():
+        # Pass --no-root so Poetry 2.0 installs dependencies without requiring [tool.poetry.name] package metadata
+        install_cmd = "pip install poetry && (poetry install --no-root --no-interaction || poetry install --no-interaction)"
+    elif (py_root / "Pipfile.lock").exists():
         install_cmd = "pip install pipenv && pipenv install --dev"
-    elif (repo_root / "requirements.txt").exists():
+    elif (py_root / "requirements.txt").exists():
         install_cmd = "pip install -r requirements.txt"
-    else:
+    elif (py_root / "setup.py").exists():
         install_cmd = "pip install -e ."
+    else:
+        install_cmd = "pip install -r requirements.txt"
 
-    # Test command priority: tox > pytest > unittest
+    if py_root != repo_root:
+        rel = py_root.relative_to(repo_root).as_posix()
+        plan.notes.append(f"Python manifest found in subdirectory: {rel}")
+        def _prefix(cmd: str) -> str:
+            return f"cd {rel} && {cmd}"
+    else:
+        def _prefix(cmd: str) -> str:
+            return cmd
+
+    # Test command priority: tox > nox > pytest > unittest
     test_cmd = None
-    if (repo_root / "tox.ini").exists():
+    if (py_root / "tox.ini").exists() or (repo_root / "tox.ini").exists():
         test_cmd = "tox"
         plan.notes.append("tox.ini found")
-    elif (repo_root / "noxfile.py").exists():
+    elif (py_root / "noxfile.py").exists() or (repo_root / "noxfile.py").exists():
         test_cmd = "nox"
         plan.notes.append("noxfile.py found")
     else:
-        # Check pyproject.toml [tool.pytest]
-        ppt = repo_root / "pyproject.toml"
+        ppt = py_root / "pyproject.toml"
         if ppt.exists() and "pytest" in _read_text(ppt):
             test_cmd = "pytest"
         else:
             test_cmd = "python -m pytest || python -m unittest discover"
 
     plan.stages = [
-        Stage("INSTALL", install_cmd, "manifest_detection", "high"),
-        Stage("TEST",    test_cmd,    "test_runner_detection", "medium"),
+        Stage("INSTALL", _prefix(install_cmd), "manifest_detection", "high"),
+        Stage("TEST",    _prefix(test_cmd),    "test_runner_detection", "medium"),
     ]
     return plan
 
