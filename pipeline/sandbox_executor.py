@@ -44,8 +44,8 @@ _BLOCKED_ENV_KEYS = {
 }
 
 
-def _safe_env() -> dict:
-    """Return a sanitised environment dict with secrets removed."""
+def _safe_env(venv_dir: Optional[Path] = None) -> dict:
+    """Return a sanitised environment dict with secrets removed and optional venv prepended."""
     env = {}
     for k, v in os.environ.items():
         if k.upper() in _BLOCKED_ENV_KEYS:
@@ -54,17 +54,15 @@ def _safe_env() -> dict:
             continue
         env[k] = v
 
-    # Explicitly prepend Python 3.9 Conda environment to PATH
-    conda_env_dir = r"C:\Users\jaspi\anaconda3\envs\diagnosis"
-    conda_paths = [
-        conda_env_dir,
-        os.path.join(conda_env_dir, "Scripts"),
-        os.path.join(conda_env_dir, "Library", "bin"),
-        r"C:\tools\maven\bin",
-    ]
     existing_path = os.environ.get("PATH", "")
-    new_path = ";".join(conda_paths) + ";" + existing_path
-    env["PATH"] = new_path
+    if venv_dir:
+        # Prepend isolated per-snapshot virtual environment Scripts directory
+        venv_scripts = str(venv_dir / "Scripts") if os.name == "nt" else str(venv_dir / "bin")
+        new_path = venv_scripts + ";" + existing_path if os.name == "nt" else venv_scripts + ":" + existing_path
+        env["PATH"] = new_path
+        env["VIRTUAL_ENV"] = str(venv_dir)
+    else:
+        env["PATH"] = existing_path
 
     env.setdefault("HOME", os.environ.get("HOME", str(Path.home())))
     # CI mode: prevents Jest/React/Angular from running in interactive watch mode
@@ -83,6 +81,7 @@ def run_stage(
     stdout_path: Path,
     stderr_path: Path,
     timeout: int = C.EXEC_TIMEOUT_TOTAL,
+    venv_dir: Optional[Path] = None,
 ) -> dict:
     """
     Execute a single stage command. Returns a result dict:
@@ -90,7 +89,7 @@ def run_stage(
     """
     logger.info(f"  [{stage_name}] {command}")
     start = time.time()
-    env = _safe_env()
+    env = _safe_env(venv_dir=venv_dir)
 
     exit_code = -1
     timed_out = False
@@ -139,6 +138,10 @@ def run_stage(
         result_str = "TIMEOUT"
     elif exit_code == 0:
         result_str = "PASS"
+    elif exit_code == 5 and "pytest" in command.lower():
+        # Pytest exit code 5: No tests collected (Install succeeded, no tests to run)
+        logger.info(f"  [{stage_name}] pytest exit=5 (NO_TESTS) -> treating as INSTALL_OK PASS")
+        result_str = "PASS"
     else:
         result_str = "FAIL"
 
@@ -154,6 +157,28 @@ def run_stage(
         "stdout_path":      str(stdout_path),
         "stderr_path":      str(stderr_path),
     }
+
+
+def _get_python_for_version(req_version: Optional[str]) -> str:
+    """Find appropriate Python binary matching requested version, or fallback to sys.executable."""
+    if not req_version or req_version == "3.x":
+        return sys.executable
+    
+    clean_v = req_version.lstrip("v").strip()
+    parts = clean_v.split(".")
+    major_minor = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else parts[0]
+
+    # Check for installed python in common paths
+    if os.name == "nt":
+        candidates = [
+            rf"C:\Python{parts[0]}{parts[1]}\python.exe" if len(parts) >= 2 else None,
+            rf"C:\Users\{os.environ.get('USERNAME', '')}\anaconda3\envs\py{parts[0]}{parts[1]}\python.exe" if len(parts) >= 2 else None,
+        ]
+        for cand in candidates:
+            if cand and Path(cand).exists():
+                return cand
+
+    return sys.executable
 
 
 def run_plan(
@@ -174,6 +199,17 @@ def run_plan(
     stage_results = []
     first_failure = None
 
+    venv_dir = None
+    if plan.ecosystem in ("pip", "python", "pypi"):
+        venv_dir = work_dir / "_venv"
+        py_bin = _get_python_for_version(plan.runtime_version)
+        try:
+            logger.info(f"  [setup_venv] Creating fresh venv using {py_bin} at {venv_dir}")
+            subprocess.run([py_bin, "-m", "venv", str(venv_dir)], check=True, capture_output=True, timeout=60)
+        except Exception as e:
+            logger.warning(f"Could not create per-snapshot venv: {e}")
+            venv_dir = None
+
     for stage in plan.stages:
         safe_repo = repo.replace("/", "__")
         slug = f"{safe_repo}__pr{pr_number}__{snapshot}__{stage.name}__att{attempt}"
@@ -187,6 +223,7 @@ def run_plan(
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             timeout=min(stage.timeout, C.EXEC_TIMEOUT_TOTAL),
+            venv_dir=venv_dir,
         )
         stage_results.append(result)
 

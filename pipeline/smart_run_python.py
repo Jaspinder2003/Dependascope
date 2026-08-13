@@ -43,50 +43,66 @@ logger = logging.getLogger("smart_run_python")
 
 def db_write(conn, sql, params=(), retries=5, base_delay=1.0):
     """Execute a write with retry-on-lock to handle concurrent access."""
-    for attempt in range(retries):
-        try:
-            conn.execute(sql, params)
-            conn.commit()
-            return
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() and attempt < retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"DB locked, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
-                time.sleep(delay)
-            else:
-                raise
+    try:
+        db.safe_execute_write(conn, sql, params, retries=retries, base_delay=base_delay)
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"  DB write warning in smart_run: {e}")
 
 
 # ─────────────────────────── Probe helper ───────────────────────────
 
+import purified_reproduce as pr
+
 def quick_install_test(repo: str, head_sha: str, before_sha: str, pr_number: int, timeout: int = 180) -> tuple[bool, str]:
     """
-    Ensure repo is cloned, check out a SHA and try install.
-    Restricted strictly to Python (pip / PyPI) environment plans.
+    Strict Probing Helper:
+      1. Causal SHA pairing check (head parent == before_sha)
+      2. Exact Python runtime availability (no fallback)
+      3. Isolated per-snapshot venv installation
     """
     ok, err = gf.clone_or_update(repo, head_sha, before_sha, pr_number)
     if not ok:
         return False, f"git_fetch_failed: {err}"
 
+    # Check 1: Causal SHA Pairing Verification
+    sha_ok, parent_sha, sha_msg = gf.verify_sha_pairing(repo, head_sha, before_sha)
+    if not sha_ok:
+        return False, f"sha_unverified: {sha_msg}"
+
     work_dir = Path(tempfile.mkdtemp(prefix=f"depbot_pyprobe_{repo.replace('/', '_')}_"))
+    venv_dir = work_dir / "_venv"
+
     try:
         ok, err = gf.checkout_snapshot_worktree(repo, before_sha, work_dir)
         if not ok:
             return False, f"checkout_failed: {err}"
 
-        # Detect ecosystem from files
+        # Check 2: Detect execution plan and requested Python version
         plan = ea.get_execution_plan("pip", work_dir)
         if not plan or not plan.stages:
             return False, "no_execution_plan"
 
-        # Strictly restrict to Python / pip ecosystem
         python_ecosystems = {"pip", "python", "pypi"}
         if plan.ecosystem not in python_ecosystems:
             return False, f"non_python_ecosystem: {plan.ecosystem}"
 
-        # Run just the install stage
+        req_py_version = plan.runtime_version
+        py_bin, act_py_ver, py_status = pr.resolve_python_runtime(req_py_version)
+        if not py_bin:
+            return False, f"missing_python_version_{req_py_version}"
+
+        # Check 3: Create fresh isolated per-snapshot venv
+        try:
+            v_proc = subprocess.run([py_bin, "-m", "venv", str(venv_dir)], capture_output=True, text=True, timeout=60)
+            if v_proc.returncode != 0:
+                return False, f"venv_creation_failed: {v_proc.stderr[:100]}"
+        except Exception as e:
+            return False, f"venv_creation_exception: {e}"
+
+        # Run install stage inside fresh venv
         install_stage = plan.stages[0]
-        env = sx._safe_env()
+        env = sx._safe_env(venv_dir=venv_dir)
 
         try:
             proc = subprocess.Popen(
@@ -114,92 +130,16 @@ def quick_install_test(repo: str, head_sha: str, before_sha: str, pr_number: int
     finally:
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
-        except:
+        except Exception:
             pass
 
 
 # ─────────────────────────── Full reproduce helper ───────────────────────────
 
 def full_reproduce(conn, row, attempt=1):
-    """Run the full BEFORE/AFTER comparison for a single Python PR."""
-    start_time = time.time()
-    repo = row["repo"]
-    pr_number = row["pr_number"]
-    ecosystem = row["ecosystem"] or "pip"
-    before_sha = row["before_sha"]
-    head_sha = row["head_sha"]
-
-    results = {"before_result": None, "after_result": None}
-
-    gf.clone_or_update(repo, head_sha, before_sha, pr_number)
-
-    for snapshot, sha in [("BEFORE", before_sha), ("AFTER", head_sha)]:
-        work_dir = Path(tempfile.mkdtemp(prefix=f"depbot_py_{repo.replace('/', '_')}_{pr_number}_{snapshot}_"))
-        try:
-            ok, err = gf.checkout_snapshot_worktree(repo, sha, work_dir)
-            if not ok:
-                results[f"{snapshot.lower()}_result"] = "UNRUNNABLE"
-                continue
-
-            plan = ea.get_execution_plan(ecosystem, work_dir)
-            if not plan or not plan.stages:
-                results[f"{snapshot.lower()}_result"] = "UNRUNNABLE"
-                continue
-
-            log_dir = C.EXEC_LOG_DIR / f"{repo.replace('/', '__')}__pr{pr_number}"
-            first_failure, stage_results = sx.run_plan(
-                plan, work_dir, log_dir, snapshot, repo, pr_number, attempt
-            )
-            results[f"{snapshot.lower()}_result"] = first_failure
-
-            # Save individual executions
-            for sr in stage_results:
-                conn.execute("""
-                    INSERT OR REPLACE INTO executions
-                    (repo, pr_number, snapshot, stage, command, exit_code,
-                     duration_seconds, result, stdout_path, stderr_path, attempt_number)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                """, (repo, pr_number, snapshot, sr["stage"], sr["command"],
-                      sr["exit_code"], sr["duration_seconds"], sr["result"],
-                      sr["stdout_path"], sr["stderr_path"], attempt))
-        finally:
-            try:
-                shutil.rmtree(work_dir, ignore_errors=True)
-            except:
-                pass
-
-    before_r = results["before_result"] or "UNRUNNABLE"
-    after_r = results["after_result"] or "UNRUNNABLE"
-
-    if before_r == "PASS" and after_r != "PASS":
-        classification = "PASS->FAIL"
-    elif before_r == "PASS" and after_r == "PASS":
-        classification = "PASS->PASS"
-    elif before_r == "UNRUNNABLE" or after_r == "UNRUNNABLE":
-        classification = "UNRUNNABLE"
-    else:
-        classification = "FAIL->FAIL"
-
-    total_duration = round(time.time() - start_time, 2)
-
-    db_write(conn, """
-        INSERT OR REPLACE INTO final_results
-        (repo, pr_number, ecosystem, before_result, after_result, classification, duration_seconds)
-        VALUES (?,?,?,?,?,?,?)
-    """, (repo, pr_number, ecosystem, before_r, after_r, classification, total_duration))
-    db_write(conn, """
-        UPDATE pull_requests SET processing_status='DONE'
-        WHERE repo=? AND pr_number=?
-    """, (repo, pr_number))
-
-    # Automatically refresh export CSV whenever a PASS->FAIL or PASS->PASS is classified
-    if classification in ("PASS->FAIL", "PASS->PASS"):
-        try:
-            export_script = Path(__file__).parent / "export_data_sample.py"
-            if export_script.exists():
-                subprocess.run([sys.executable, str(export_script)], capture_output=True)
-        except Exception as e:
-            logger.warning(f"Could not auto-update export CSV: {e}")
+    """Run full purified 12-point reproduction for a single Python PR."""
+    purified_res = pr.run_purified_reproduction(conn, row)
+    classification = purified_res["classification"]
 
     return classification
 
@@ -320,9 +260,19 @@ def cmd_run(args):
                     classification = full_reproduce(conn, row)
                 except Exception as e:
                     logger.error(f"  ERROR on {repo}#{pr_num}: {e}")
-                    conn.execute("UPDATE pull_requests SET processing_status='DONE' WHERE repo=? AND pr_number=?", (repo, pr_num))
-                    conn.commit()
                     classification = "UNRUNNABLE"
+
+                # Always mark DONE so this PR is never picked up again on restart.
+                # Wrapped in its own try/except so a DB lock here can't crash the loop.
+                try:
+                    db_write(conn, "UPDATE pull_requests SET processing_status='DONE' WHERE repo=? AND pr_number=?", (repo, pr_num))
+                except Exception as done_err:
+                    logger.warning(f"  Could not mark DONE for {repo}#{pr_num}: {done_err} — will retry on next start")
+
+                # Export new run result exclusively to python_new_runs_results.csv
+                # Keeps python_rerun_results.csv and python_purified_results.csv completely untouched!
+                NEW_RUNS_CSV_PATH = Path(__file__).parent.parent.parent / "python_new_runs_results.csv"
+                pr.export_purified_csv(conn, target_csv_path=NEW_RUNS_CSV_PATH)
 
                 stats[classification] = stats.get(classification, 0) + 1
                 logger.info(f"  => {classification}")

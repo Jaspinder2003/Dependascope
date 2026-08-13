@@ -206,3 +206,27 @@ def checkout_snapshot_worktree(repo: str, sha: str, work_dir: Path) -> tuple[boo
     if rc != 0:
         return False, f"git checkout {sha} failed: {err}"
     return True, ""
+
+
+def verify_sha_pairing(repo: str, head_sha: str, before_sha: str) -> tuple[bool, str, str]:
+    """
+    Verify causal pairing: check if before_sha is the first parent of head_sha (or in its direct parent chain).
+    Returns (verified_bool, parent_sha, message).
+    """
+    cache = repo_cache_path(repo)
+    if not cache.exists():
+        return False, "", "repo cache missing"
+
+    rc, out, err = _run(["git", "-C", str(cache), "rev-parse", f"{head_sha}^1"])
+    if rc == 0 and out.strip():
+        parent_sha = out.strip()
+        if parent_sha.lower() == before_sha.lower():
+            return True, parent_sha, "exact_parent_match"
+        else:
+            # Check if before_sha is in the first parent history chain
+            rc2, out2, _ = _run(["git", "-C", str(cache), "rev-list", "--first-parent", "-n", "10", head_sha])
+            if rc2 == 0 and before_sha.lower() in [s.strip().lower() for s in out2.splitlines()]:
+                return True, parent_sha, "parent_chain_match"
+            return False, parent_sha, f"parent_mismatch (head parent: {parent_sha[:8]}, expected: {before_sha[:8]})"
+
+    return False, "", "could_not_parse_parent"

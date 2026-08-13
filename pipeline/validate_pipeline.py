@@ -95,7 +95,7 @@ db.upsert_pr(conn, {
     "merge_sha": None, "ecosystem": "npm", "labels": '["dependencies"]',
     "comments_count": 0, "commits_count": 1,
     "additions": 1, "deletions": 1, "changed_files": 2,
-    "priority_score": None, "strict_or_complex": "UNKNOWN",
+    "local_priority_score": None, "strict_or_complex": "UNKNOWN",
     "classification_reason": "", "processing_status": "PENDING",
     "source_dataset": "test", "source_file": "test",
 })

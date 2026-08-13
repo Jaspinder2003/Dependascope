@@ -242,17 +242,30 @@ def plan_pip(repo_root: Path) -> ExecutionPlan:
     plan.runtime_version = python_version or "3.x"
 
     # Determine install command
-    if (py_root / "poetry.lock").exists() or (py_root / "pyproject.toml").exists():
-        # Pass --no-root so Poetry 2.0 installs dependencies without requiring [tool.poetry.name] package metadata
+    # --prefer-binary: use pre-built wheels instead of building from source.
+    # This is the biggest single speed improvement — source builds can take
+    # 5-10 minutes while downloading a wheel takes seconds.
+    PIP_FAST = "pip install --prefer-binary"
+
+    has_poetry = (py_root / "poetry.lock").exists()
+    if (py_root / "pyproject.toml").exists():
+        pyproj_text = _read_text(py_root / "pyproject.toml")
+        if "[tool.poetry]" in pyproj_text:
+            has_poetry = True
+
+    if has_poetry:
         install_cmd = "pip install poetry && (poetry install --no-root --no-interaction || poetry install --no-interaction)"
-    elif (py_root / "Pipfile.lock").exists():
+    elif (py_root / "Pipfile.lock").exists() or (py_root / "Pipfile").exists():
         install_cmd = "pip install pipenv && pipenv install --dev"
     elif (py_root / "requirements.txt").exists():
-        install_cmd = "pip install -r requirements.txt"
-    elif (py_root / "setup.py").exists():
-        install_cmd = "pip install -e ."
+        install_cmd = f"{PIP_FAST} -r requirements.txt"
+        req_dev = py_root / "requirements-dev.txt"
+        if req_dev.exists():
+            install_cmd += f" && {PIP_FAST} -r requirements-dev.txt"
+    elif (py_root / "setup.py").exists() or (py_root / "pyproject.toml").exists():
+        install_cmd = f"{PIP_FAST} ."
     else:
-        install_cmd = "pip install -r requirements.txt"
+        install_cmd = f"{PIP_FAST} ."
 
     if py_root != repo_root:
         rel = py_root.relative_to(repo_root).as_posix()
@@ -263,25 +276,37 @@ def plan_pip(repo_root: Path) -> ExecutionPlan:
         def _prefix(cmd: str) -> str:
             return cmd
 
-    # Test command priority: tox > nox > pytest > unittest
+    # Smart test command detection: tox > nox > pytest > unittest > none
     test_cmd = None
+    has_pytest = (
+        (py_root / "pytest.ini").exists() or (repo_root / "pytest.ini").exists() or
+        (py_root / "setup.cfg").exists() or (repo_root / "setup.cfg").exists() or
+        (py_root / "tests").exists() or (repo_root / "tests").exists() or
+        (py_root / "test").exists() or (repo_root / "test").exists() or
+        bool(list(py_root.glob("test_*.py"))) or bool(list(repo_root.glob("test_*.py")))
+    )
+
     if (py_root / "tox.ini").exists() or (repo_root / "tox.ini").exists():
         test_cmd = "tox"
         plan.notes.append("tox.ini found")
     elif (py_root / "noxfile.py").exists() or (repo_root / "noxfile.py").exists():
         test_cmd = "nox"
         plan.notes.append("noxfile.py found")
+    elif has_pytest:
+        test_cmd = "python -m pytest"
     else:
-        ppt = py_root / "pyproject.toml"
-        if ppt.exists() and "pytest" in _read_text(ppt):
-            test_cmd = "pytest"
+        unittest_files = list(py_root.glob("**/test*.py")) or list(repo_root.glob("**/test*.py"))
+        if unittest_files:
+            test_cmd = "python -m unittest discover"
         else:
-            test_cmd = "python -m pytest || python -m unittest discover"
+            test_cmd = None
 
     plan.stages = [
         Stage("INSTALL", _prefix(install_cmd), "manifest_detection", "high"),
-        Stage("TEST",    _prefix(test_cmd),    "test_runner_detection", "medium"),
     ]
+    if test_cmd:
+        plan.stages.append(Stage("TEST", _prefix(test_cmd), "test_runner_detection", "medium"))
+
     return plan
 
 

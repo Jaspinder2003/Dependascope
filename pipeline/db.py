@@ -177,6 +177,35 @@ CREATE TABLE IF NOT EXISTS final_results (
     PRIMARY KEY (repo, pr_number)
 );
 
+-- ── Purified results (Strict hardened cohort) ──────────────────────────────────
+CREATE TABLE IF NOT EXISTS purified_results (
+    repo                      TEXT NOT NULL,
+    pr_number                 INTEGER NOT NULL,
+    ecosystem                 TEXT,
+    cohort                    TEXT,   -- STRICT_SINGLE | GROUPED | COMPLEX | UNKNOWN
+    before_sha                TEXT,
+    after_sha                 TEXT,
+    after_parent_sha          TEXT,
+    sha_pair_verified         INTEGER DEFAULT 0,
+    requested_python_version  TEXT,
+    actual_python_executable  TEXT,
+    actual_python_version     TEXT,
+    runtime_source            TEXT,
+    before_install_result     TEXT,   -- INSTALL_PASS | INSTALL_FAIL | UNRUNNABLE
+    before_test_result        TEXT,   -- TEST_PASS | TEST_FAIL | NO_TESTS | TEST_UNRUNNABLE | NONE
+    before_final_state        TEXT,   -- PASS | FAIL | UNRUNNABLE
+    after_install_result      TEXT,   -- INSTALL_PASS | INSTALL_FAIL | UNRUNNABLE
+    after_test_result         TEXT,   -- TEST_PASS | TEST_FAIL | NO_TESTS | TEST_UNRUNNABLE | NONE
+    after_final_state         TEXT,   -- PASS | FAIL | UNRUNNABLE
+    classification            TEXT,   -- PASS->PASS | PASS->FAIL | TEST_REGRESSION | INSTALLABILITY_REGRESSION | FAIL->FAIL | FAIL->PASS | UNRUNNABLE
+    evidence_tier             TEXT DEFAULT 'T0',  -- T3 | T2 | T1 | T0
+    failure_point             TEXT,
+    failure_excerpt           TEXT,
+    duration_seconds          REAL,
+    created_at                TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (repo, pr_number)
+);
+
 -- ── GitHub API response cache ────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS github_cache (
     cache_key    TEXT PRIMARY KEY,
@@ -219,9 +248,15 @@ CREATE INDEX IF NOT EXISTS idx_comments_rp  ON pr_comments(repo, pr_number);
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
-    """Return a WAL-mode SQLite connection with 60s lock timeout."""
-    conn = sqlite3.connect(str(db_path), timeout=60.0, check_same_thread=False)
+    """Return a WAL-mode SQLite connection with 120s lock timeout.
+
+    PRAGMA busy_timeout=30000 tells the SQLite engine to retry internally
+    for up to 30 seconds before raising OperationalError: database is locked.
+    This allows smart_run_python and rerun_purified_python to run simultaneously.
+    """
+    conn = sqlite3.connect(str(db_path), timeout=120.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")   # 30s internal SQLite retry
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
@@ -246,14 +281,24 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     except Exception as e:
         logger.warning(f"Could not check/migrate duration_seconds column: {e}")
 
+    # Migration: Ensure evidence_tier column exists in purified_results
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(purified_results)").fetchall()]
+        if "evidence_tier" not in cols:
+            conn.execute("ALTER TABLE purified_results ADD COLUMN evidence_tier TEXT DEFAULT 'T0'")
+            conn.commit()
+            logger.info("Migrated purified_results table: added evidence_tier column")
+    except Exception as e:
+        logger.warning(f"Could not check/migrate evidence_tier column (may be locked, will retry on next start): {e}")
+
     logger.info("Database initialized at %s", db_path)
     return conn
 
 
 # ─── Upsert helpers ───────────────────────────────────────────────────────────
 
-def safe_execute_write(conn: sqlite3.Connection, sql: str, params: tuple = (), retries: int = 5, base_delay: float = 1.0) -> None:
-    """Execute a write query with lock retry exponential backoff."""
+def safe_execute_write(conn: sqlite3.Connection, sql: str, params: tuple = (), retries: int = 10, base_delay: float = 0.5) -> None:
+    """Execute a write query with lock retry exponential backoff (up to 10 retries)."""
     import time
     for attempt in range(retries):
         try:
@@ -261,7 +306,7 @@ def safe_execute_write(conn: sqlite3.Connection, sql: str, params: tuple = (), r
             return
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower() and attempt < retries - 1:
-                delay = base_delay * (2 ** attempt)
+                delay = min(base_delay * (1.5 ** attempt), 3.0)
                 logger.warning(f"Database locked in write execution, retrying in {delay:.1f}s (attempt {attempt+1}/{retries})")
                 time.sleep(delay)
             else:
