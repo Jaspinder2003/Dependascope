@@ -11,6 +11,7 @@ Authenticated GitHub REST API client with:
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -164,3 +165,77 @@ def check_rate_limit(conn: Any) -> dict:
     url = f"{C.GITHUB_API_BASE}/rate_limit"
     data, _ = get(url, conn, force_refresh=True)
     return data or {}
+
+
+def check_commit_ci_status(conn: Any, owner: str, repo: str, sha: str) -> Optional[str]:
+    """
+    Shared CI-status check used both at candidate-discovery time (skip a PR
+    before it's even queued) and as a run-time pre-screen (skip local
+    reproduction). Returns:
+      "failure" — GitHub's combined status or check-runs show a definitive
+                  failure for this commit
+      "success" — combined status is definitively green
+      None      — no CI signal at all (very common for small repos), or the
+                  signal is inconclusive (pending/mixed) — callers must treat
+                  this as "unknown", never as evidence either way.
+    """
+    statuses = get_commit_statuses(conn, owner, repo, sha)
+    if statuses and statuses.get("total_count", 0) > 0:
+        state = statuses.get("state")
+        if state == "failure":
+            return "failure"
+        if state == "success":
+            return "success"
+
+    check_runs = get_check_runs(conn, owner, repo, sha)
+    if check_runs and check_runs.get("total_count", 0) > 0:
+        runs = check_runs.get("check_runs", [])
+        completed = [r for r in runs if r.get("status") == "completed"]
+
+        # Only "decisive" conclusions say anything about the code. Conditional
+        # jobs routinely report skipped/neutral/stale, and cancelled means a
+        # human or a newer run interrupted it — none of those are evidence
+        # either way. Requiring *every* run to be "success" (the previous
+        # behaviour) meant a single skipped job made an otherwise-green commit
+        # unreadable, which is why ~80% of candidates looked like "no CI data"
+        # when repos in fact had 20-228 check runs.
+        conclusions = [
+            r.get("conclusion") for r in completed
+            if r.get("conclusion") not in (None, "skipped", "neutral", "stale", "cancelled", "action_required")
+        ]
+        if conclusions:
+            if any(c in ("failure", "timed_out") for c in conclusions):
+                return "failure"
+            if all(c == "success" for c in conclusions):
+                return "success"
+
+    return None
+
+
+def get_paginated_count(url: str, params: Optional[dict] = None) -> Optional[int]:
+    """
+    Determine total item count for a paginated list endpoint (e.g. commits,
+    contributors) without fetching every page — uses GitHub's standard
+    pagination trick: request per_page=1 and read the last page number from
+    the Link response header. Not run through the JSON response cache
+    (headers aren't stored in github_cache); cheap enough to call fresh.
+    Returns None if the request fails.
+    """
+    session = _get_session()
+    p = dict(params or {})
+    p["per_page"] = 1
+    try:
+        resp = session.get(url, params=p, timeout=C.GITHUB_REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    link = resp.headers.get("Link", "")
+    m = re.search(r'[?&]page=(\d+)[^>]*>;\s*rel="last"', link)
+    if m:
+        return int(m.group(1))
+    try:
+        data = resp.json()
+        return len(data) if isinstance(data, list) else None
+    except Exception:
+        return None

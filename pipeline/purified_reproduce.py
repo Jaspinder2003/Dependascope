@@ -98,7 +98,8 @@ def resolve_python_runtime(requested_version: Optional[str]) -> tuple[Optional[s
     """
     if not requested_version or requested_version == "3.x":
         # Accept system default Python
-        v_out = subprocess.run([sys.executable, "--version"], capture_output=True, text=True)
+        v_out = subprocess.run([sys.executable, "--version"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
         act_ver = v_out.stdout.strip() or v_out.stderr.strip()
         return sys.executable, act_ver, "SYSTEM_DEFAULT"
 
@@ -120,12 +121,14 @@ def resolve_python_runtime(requested_version: Optional[str]) -> tuple[Optional[s
     
     for cand in candidates:
         if cand and Path(cand).exists():
-            v_out = subprocess.run([cand, "--version"], capture_output=True, text=True)
+            v_out = subprocess.run([cand, "--version"], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace")
             act_ver = v_out.stdout.strip() or v_out.stderr.strip()
             return cand, act_ver, "EXACT_MATCH"
 
     # Check sys.executable version
-    sys_v_out = subprocess.run([sys.executable, "--version"], capture_output=True, text=True)
+    sys_v_out = subprocess.run([sys.executable, "--version"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
     sys_ver_str = sys_v_out.stdout.strip() or sys_v_out.stderr.strip()
     if target_ver_str in sys_ver_str:
         return sys.executable, sys_ver_str, "SYSTEM_MATCH"
@@ -172,7 +175,8 @@ def reproduce_snapshot(
 
         # Create fresh per-snapshot venv
         try:
-            v_proc = subprocess.run([py_bin, "-m", "venv", str(venv_dir)], capture_output=True, text=True, timeout=60)
+            v_proc = subprocess.run([py_bin, "-m", "venv", str(venv_dir)], capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", timeout=60)
             if v_proc.returncode != 0:
                 res["failure_point"] = "VENV_CREATION"
                 res["failure_excerpt"] = f"venv creation failed: {v_proc.stderr[:300]}"

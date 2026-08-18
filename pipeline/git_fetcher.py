@@ -34,6 +34,8 @@ def _run(cmd: list[str], cwd: Optional[Path] = None,
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             env=env,
         )
