@@ -314,6 +314,14 @@ def safe_execute_write(conn: sqlite3.Connection, sql: str, params: tuple = (), r
 
 
 def upsert_pr(conn: sqlite3.Connection, row: dict) -> None:
+    """
+    Insert or update one pull request row.
+
+    Keyed on (repo, pr_number). `processing_status` is deliberately protected
+    alongside the key columns: once a pull request has been marked DONE or
+    probed, re-fetching it from GitHub must not reset that state and cause the
+    same work to be repeated.
+    """
     cols = list(row.keys())
     placeholders = ", ".join("?" for _ in cols)
     col_names    = ", ".join(cols)
@@ -331,6 +339,13 @@ def upsert_pr(conn: sqlite3.Connection, row: dict) -> None:
 
 
 def upsert_dep_change(conn: sqlite3.Connection, row: dict) -> None:
+    """
+    Insert or update one dependency-change row.
+
+    Keyed on (repo, pr_number, manifest_path, dependency), so a pull request
+    touching the same dependency in several manifests records one row per
+    manifest rather than overwriting itself.
+    """
     cols = list(row.keys())
     placeholders = ", ".join("?" for _ in cols)
     col_names    = ", ".join(cols)
@@ -346,6 +361,12 @@ def upsert_dep_change(conn: sqlite3.Connection, row: dict) -> None:
 def upsert_manifest_content(conn: sqlite3.Connection, repo: str, pr_number: int,
                              snapshot: str, manifest_path: str, content: str,
                              fetch_method: str) -> None:
+    """
+    Store the contents of one manifest file at one snapshot.
+
+    Keyed on (repo, pr_number, snapshot, manifest_path). Re-fetching refreshes
+    the stored content and its fetch timestamp rather than duplicating the row.
+    """
     sql = """INSERT INTO manifest_contents
            (repo, pr_number, snapshot, manifest_path, content, fetch_method)
            VALUES (?,?,?,?,?,?)
@@ -357,6 +378,12 @@ def upsert_manifest_content(conn: sqlite3.Connection, repo: str, pr_number: int,
 
 def log_event(conn: sqlite3.Connection, repo: str, pr_number: Optional[int],
               stage: str, message: str, level: str = "INFO") -> None:
+    """
+    Append a processing-log entry for a repository or pull request.
+
+    Deliberately does not commit: callers batch many events into a single
+    transaction, and committing per event would dominate the run's I/O.
+    """
     safe_execute_write(
         conn,
         "INSERT INTO processing_log (repo, pr_number, stage, message, level) VALUES (?,?,?,?,?)",
@@ -368,6 +395,9 @@ def log_event(conn: sqlite3.Connection, repo: str, pr_number: Optional[int],
 # ─── Cache helpers ────────────────────────────────────────────────────────────
 
 def cache_get(conn: sqlite3.Connection, key: str) -> Optional[Any]:
+    """
+    Return the cached JSON response for `key`, or None when not cached.
+    """
     row = conn.execute(
         "SELECT response_body FROM github_cache WHERE cache_key=?", (key,)
     ).fetchone()
@@ -375,6 +405,13 @@ def cache_get(conn: sqlite3.Connection, key: str) -> Optional[Any]:
 
 
 def cache_set(conn: sqlite3.Connection, key: str, data: Any, status_code: int = 200) -> None:
+    """
+    Store a JSON response against `key`, refreshing it if already present.
+
+    The cache is what keeps repeated runs affordable: the GitHub API is rate
+    limited, and most candidates are re-examined several times across
+    discovery, collection and reproduction.
+    """
     sql = """INSERT INTO github_cache (cache_key, response_body, status_code)
            VALUES (?,?,?)
            ON CONFLICT(cache_key) DO UPDATE SET response_body=excluded.response_body,
@@ -385,6 +422,9 @@ def cache_set(conn: sqlite3.Connection, key: str, data: Any, status_code: int = 
 # ─── Gate helpers ─────────────────────────────────────────────────────────────
 
 def gate_is_passed(conn: sqlite3.Connection, gate: str) -> bool:
+    """
+    True when the named pipeline gate has been marked as passed.
+    """
     row = conn.execute(
         "SELECT passed FROM pipeline_gates WHERE gate=?", (gate,)
     ).fetchone()
@@ -392,6 +432,12 @@ def gate_is_passed(conn: sqlite3.Connection, gate: str) -> bool:
 
 
 def gate_set_passed(conn: sqlite3.Connection, gate: str, notes: str = "") -> None:
+    """
+    Mark a pipeline gate as passed, recording the time and any notes.
+
+    Gates record that a prerequisite stage completed successfully, so a later
+    stage can refuse to run against half-prepared data.
+    """
     conn.execute(
         """INSERT INTO pipeline_gates (gate, passed, passed_at, notes)
            VALUES (?,1,datetime('now'),?)

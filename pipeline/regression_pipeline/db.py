@@ -102,6 +102,15 @@ CREATE INDEX IF NOT EXISTS idx_results_class      ON results(classification);
 
 
 def get_connection() -> sqlite3.Connection:
+    """
+    Open the regression database, creating and migrating it if needed.
+
+    Returns a connection in autocommit mode with WAL journalling and a 30s
+    busy timeout, configured for concurrent access by several worker
+    processes. The schema is applied on every call (all statements are
+    IF NOT EXISTS), and missing columns added by later revisions are patched
+    in, so an older database file is upgraded in place rather than rebuilt.
+    """
     REGRESSION_DIR.mkdir(parents=True, exist_ok=True)
     # isolation_level=None -> autocommit. Python's sqlite3 otherwise opens an
     # implicit transaction before every INSERT/UPDATE, which then collides with
@@ -116,6 +125,20 @@ def get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
     conn.executescript(DDL)
+    bcols = [r[1] for r in conn.execute("PRAGMA table_info(baseline_cache)").fetchall()]
+    if "python_bin" not in bcols:
+        # The interpreter the cached BEFORE actually ran on. A baseline reused
+        # across candidates must pin AFTER to the same interpreter, or the two
+        # snapshots are no longer comparable and any difference between them
+        # could be the Python version rather than the dependency.
+        conn.execute("ALTER TABLE baseline_cache ADD COLUMN python_bin TEXT")
+
+    if "tests_json" not in bcols:
+        # Per-test outcomes of the BEFORE run. Must live in the cache too: a
+        # reused baseline that carried no test map would make every subset
+        # regression undetectable for that commit.
+        conn.execute("ALTER TABLE baseline_cache ADD COLUMN tests_json TEXT")
+
     cols = [r[1] for r in conn.execute("PRAGMA table_info(candidates)").fetchall()]
     if "claimed_at" not in cols:
         conn.execute("ALTER TABLE candidates ADD COLUMN claimed_at TEXT")
@@ -130,7 +153,19 @@ def get_connection() -> sqlite3.Connection:
     for col, decl in (("evidence_strength", "TEXT"),
                        ("confirmation", "TEXT"),
                        ("attempts", "INTEGER DEFAULT 1"),
-                       ("baseline_reused", "INTEGER DEFAULT 0")):
+                       ("baseline_reused", "INTEGER DEFAULT 0"),
+                       # before_sha/after_sha record what was actually tested,
+                       # which is not always what was collected: a pair whose
+                       # recorded base has drifted gets re-anchored onto the
+                       # dependabot commit and its parent. These two columns
+                       # keep that substitution visible and auditable.
+                       ("sha_reanchored", "INTEGER DEFAULT 0"),
+                       ("sha_note", "TEXT"),
+                       # Per-test evidence: how many tests were green at the
+                       # parent commit, how many of those broke, and which.
+                       ("tests_passing_before", "INTEGER"),
+                       ("tests_regressed", "INTEGER"),
+                       ("regressed_tests", "TEXT")):
         if col not in rcols:
             conn.execute(f"ALTER TABLE results ADD COLUMN {col} {decl}")
     conn.commit()

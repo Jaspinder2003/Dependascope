@@ -42,6 +42,16 @@ _SKIP_DIR_NAMES = {
 
 @dataclass
 class ExecutionPlan:
+    """
+    How a project's health should be verified after installation.
+
+    `strategy` is either a real test suite, an import smoke test, or nothing
+    usable. `evidence_strength` records how much a pass is worth: a real suite
+    is strong evidence, whereas a successful import only proves the package
+    loads. A *failing* import after an update remains solid breakage evidence
+    either way, so the distinction is recorded rather than used to discard
+    results.
+    """
     strategy: str                          # "pytest_real" | "import_smoke" | "none"
     command: Optional[str]                 # shell command (pytest_real only)
     detail: str                            # human-readable justification
@@ -55,10 +65,20 @@ class ExecutionPlan:
 
 
 def _venv_python(venv_dir: Path) -> str:
+    """
+    Path to the Python interpreter inside `venv_dir`, per platform.
+    """
     return str(venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
 
 
 def _iter_py_files(root: Path):
+    """
+    Yield the project's own Python files, skipping vendored and build trees.
+
+    Directories such as virtualenvs, caches and site-packages are excluded so
+    that test-file detection reflects the project itself rather than its
+    installed dependencies.
+    """
     for p in root.rglob("*.py"):
         try:
             rel_parts = p.relative_to(root).parts[:-1]
@@ -155,6 +175,17 @@ def _discover_import_targets(repo_root: Path) -> list[str]:
 
 
 def detect_execution_plan(repo_root: Path, venv_dir: Path) -> ExecutionPlan:
+    """
+    Choose how to verify the project, preferring a real test suite.
+
+    If the repository shows any test signal (a test directory, or files named
+    in the test_*.py / *_test.py conventions), pytest collection is attempted
+    and a real suite is used when it collects at least one test. When there is
+    no suite, collection returns nothing, or collection errors outright, the
+    plan falls back to importing the project's top-level packages as a smoke
+    test. Returns a plan with strategy "none" when neither is possible, which
+    the classifier treats as no meaningful execution rather than as a failure.
+    """
     has_test_signal = (
         any((repo_root / d).exists() for d in _TEST_DIR_NAMES)
         or any(f.name.startswith("test_") or f.name.endswith("_test.py") for f in _iter_py_files(repo_root))

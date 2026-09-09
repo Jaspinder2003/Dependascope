@@ -71,6 +71,27 @@ def _safe_env(venv_dir: Optional[Path] = None) -> dict:
     # Non-interactive execution flags: prevent hanging on terminal prompts
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["PIP_NO_INPUT"] = "1"
+
+    # ── Thermal ceiling ────────────────────────────────────────────────────
+    # This laptop shut itself down from heat once already. The hottest thing
+    # the pipeline does is compile C/C++ extensions from source (numpy, lxml,
+    # pydantic-core, ...), and by default every build tool fans out across all
+    # cores at 100% — a sustained all-core load is exactly what spikes the
+    # temperature. Capping the parallelism of the build and math layers bounds
+    # the PEAK heat any single candidate can generate, which is what makes it
+    # safe to consider overlapping two of them later. Each var targets a
+    # different builder/runtime; harmless when that tool is absent.
+    import os as _os
+    _CAP = _os.environ.get("DEPBOT_BUILD_CAP", "2")
+    env.setdefault("MAKEFLAGS", f"-j{_CAP}")      # make / most C builds
+    env.setdefault("CMAKE_BUILD_PARALLEL_LEVEL", _CAP)  # cmake (pyarrow, etc.)
+    env.setdefault("MAX_JOBS", _CAP)              # ninja / torch extensions
+    env.setdefault("NPY_NUM_BUILD_JOBS", _CAP)    # numpy's own build
+    # Runtime thread caps: keep test suites that spin up BLAS/OpenMP pools from
+    # saturating every core (and oversubscribing when work does overlap).
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        env.setdefault(var, _CAP)
     return env
 
 
@@ -103,6 +124,10 @@ def run_stage(
                 stdout=fout,
                 stderr=ferr,
                 env=env,
+                # Own process group, so the killpg() below reaps only this
+                # stage's subtree. Without it the stage shares the worker's
+                # group and a timeout SIGKILLs the worker itself.
+                start_new_session=(os.name != "nt"),
             )
             try:
                 proc.communicate(timeout=timeout)

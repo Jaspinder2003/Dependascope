@@ -38,11 +38,29 @@ _EXTRA_REQ = ["requirements-dev.txt", "requirements-test.txt", "dev-requirements
 # "python -m pip", never bare "pip": if a requirements file pins pip itself,
 # the pip.exe wrapper cannot overwrite its own running executable on Windows
 # and dies with "ERROR: To modify pip, please run the following command...".
-PIP = "python -m pip install --prefer-binary"
+#
+# --no-compile: skip byte-compiling installed modules. In a disposable
+#   test-once venv the .pyc cache is never reused, so compilation at install
+#   time is pure wasted CPU — which on this thermally-limited laptop is wasted
+#   heat. Modules still byte-compile lazily on first import when a test needs
+#   them, so nothing breaks; we just stop paying to compile the entire
+#   dependency tree up front.
+# --disable-pip-version-check / --no-input: cut a network round-trip and any
+#   possibility of an interactive stall.
+PIP = "python -m pip install --prefer-binary --no-compile --disable-pip-version-check --no-input"
 
 
 @dataclass
 class InstallPlan:
+    """
+    How a project's dependencies should be installed.
+
+    `command` is the shell command to run, `project_dir` the directory to run
+    it from (which may be a subdirectory rather than the repository root), and
+    `kind` records which strategy was chosen. `requires_python` carries the
+    project's declared interpreter constraint, used to select a compatible
+    interpreter before the snapshot runs.
+    """
     command: str
     project_dir: Path
     kind: str                      # "requirements" | "package" | "poetry" | "pipenv"
@@ -50,6 +68,14 @@ class InstallPlan:
 
 
 def _is_installable_package(d: Path) -> bool:
+    """
+    True when `d` looks like an installable Python package.
+
+    A setup.py or pyproject.toml is taken at face value. A setup.cfg counts
+    only when it actually carries packaging metadata, since the file is also
+    used for unrelated tool configuration and its mere presence would otherwise
+    cause a non-package directory to be treated as installable.
+    """
     if (d / "setup.py").exists() or (d / "pyproject.toml").exists():
         return True
     cfg = d / "setup.cfg"
@@ -114,6 +140,13 @@ def _read_requires_python(d: Path) -> Optional[str]:
 
 
 def _candidate_dirs(repo_root: Path) -> list[Path]:
+    """
+    Directories to search for an install target, repository root first.
+
+    Many repositories keep the Python project in a subdirectory (src, backend,
+    app and similar), so those are searched as well. Order matters: the root is
+    preferred when it is itself installable.
+    """
     dirs = [repo_root]
     for s in _SUBDIRS:
         p = repo_root / s

@@ -20,6 +20,14 @@ from typing import Optional
 
 @dataclass
 class Stage:
+    """
+    One command in a project's build or test sequence.
+
+    `source` records where the command was inferred from (a CI workflow, a
+    manifest, or a built-in default) and `confidence` how reliable that
+    inference is, so a plan assembled from weak guesses can be told apart from
+    one read directly out of the project's own CI configuration.
+    """
     name: str           # INSTALL / BUILD / TEST / etc.
     command: str
     source: str         # where this command was inferred from
@@ -29,6 +37,14 @@ class Stage:
 
 @dataclass
 class ExecutionPlan:
+    """
+    The full sequence of stages needed to build and test a project.
+
+    Alongside the stages themselves it records the ecosystem and the runtime
+    version the project expects, plus where that version was found. The runtime
+    matters because both snapshots of a candidate must run on the same one for
+    the comparison to be valid.
+    """
     ecosystem: str
     runtime_version: Optional[str]
     runtime_source: str
@@ -39,6 +55,13 @@ class ExecutionPlan:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _read_text(path: Path) -> str:
+    """
+    Read a file as text, returning "" if it cannot be read.
+
+    Detection walks over many optional files, most of which will not exist in
+    any given repository, so an unreadable file is an expected outcome rather
+    than an error worth propagating.
+    """
     try:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -46,6 +69,12 @@ def _read_text(path: Path) -> str:
 
 
 def _find_ci_workflows(repo_root: Path) -> list[Path]:
+    """
+    Return the repository's GitHub Actions workflow files, if any.
+
+    Workflows are the most reliable source of a project's real build and test
+    commands, since they are what the maintainers actually run.
+    """
     wf_dir = repo_root / ".github" / "workflows"
     if not wf_dir.exists():
         return []
@@ -59,11 +88,22 @@ def _extract_node_version(text: str) -> Optional[str]:
 
 
 def _extract_python_version(text: str) -> Optional[str]:
+    """
+    First Python version pinned in the given CI workflow text, or None.
+
+    Note this takes the first match anywhere in the file. In a build matrix, or
+    where a lint job pins an older interpreter, that may be an arbitrary choice
+    among several supported versions, so the result is treated as a preference
+    rather than a hard requirement.
+    """
     m = re.search(r"python-version['\"]?\s*[:=]\s*['\"]?([0-9.]+)", text)
     return m.group(1) if m else None
 
 
 def _extract_java_version(text: str) -> Optional[str]:
+    """
+    First Java version pinned in the given CI workflow text, or None.
+    """
     m = re.search(r"java-version['\"]?\s*[:=]\s*['\"]?([0-9.]+)", text)
     return m.group(1) if m else None
 
@@ -113,6 +153,13 @@ def _find_npm_root(repo_root: Path) -> Path:
 
 
 def plan_npm(repo_root: Path) -> ExecutionPlan:
+    """
+    Build an execution plan for a Node project.
+
+    Prefers commands and the Node version declared in CI workflows, falling
+    back to the scripts declared in package.json and then to conventional
+    defaults.
+    """
     plan = ExecutionPlan(ecosystem="npm", runtime_version=None, runtime_source="default")
     node_version = None
 
@@ -183,9 +230,21 @@ def plan_npm(repo_root: Path) -> ExecutionPlan:
     if js_root != repo_root:
         rel = js_root.relative_to(repo_root).as_posix()
         def _prefix(cmd: str) -> str:
+            """
+            Prefix a command so it runs in the project subdirectory, if there is one.
+
+            Many repositories keep the project below the repository root, so commands
+            must be run from there rather than from the top level.
+            """
             return f"cd {rel} && {cmd}"
     else:
         def _prefix(cmd: str) -> str:
+            """
+            Prefix a command so it runs in the project subdirectory, if there is one.
+
+            Many repositories keep the project below the repository root, so commands
+            must be run from there rather than from the top level.
+            """
             return cmd
 
     plan.stages = [
@@ -222,6 +281,13 @@ def _find_pip_root(repo_root: Path) -> Path:
 
 
 def plan_pip(repo_root: Path) -> ExecutionPlan:
+    """
+    Build an execution plan for a Python project.
+
+    Prefers the interpreter version and commands declared in CI workflows,
+    falling back to the project's manifests (requirements files, pyproject,
+    Pipfile) and then to conventional defaults.
+    """
     plan = ExecutionPlan(ecosystem="pip", runtime_version=None, runtime_source="default")
     python_version = None
 
@@ -271,9 +337,21 @@ def plan_pip(repo_root: Path) -> ExecutionPlan:
         rel = py_root.relative_to(repo_root).as_posix()
         plan.notes.append(f"Python manifest found in subdirectory: {rel}")
         def _prefix(cmd: str) -> str:
+            """
+            Prefix a command so it runs in the project subdirectory, if there is one.
+
+            Many repositories keep the project below the repository root, so commands
+            must be run from there rather than from the top level.
+            """
             return f"cd {rel} && {cmd}"
     else:
         def _prefix(cmd: str) -> str:
+            """
+            Prefix a command so it runs in the project subdirectory, if there is one.
+
+            Many repositories keep the project below the repository root, so commands
+            must be run from there rather than from the top level.
+            """
             return cmd
 
     # Smart test command detection: tox > nox > pytest > unittest > none
@@ -325,6 +403,9 @@ def _find_pom_root(repo_root: Path) -> Path:
 
 
 def plan_maven(repo_root: Path) -> ExecutionPlan:
+    """
+    Build an execution plan for a Maven project, including the Java version.
+    """
     plan = ExecutionPlan(ecosystem="maven", runtime_version=None, runtime_source="default")
     java_version = None
 
@@ -344,9 +425,15 @@ def plan_maven(repo_root: Path) -> ExecutionPlan:
         rel = mvn_root.relative_to(repo_root).as_posix()
         plan.notes.append(f"pom.xml found in subdirectory: {rel}")
         def _mvn(cmd: str) -> str:
+            """
+            Prefix a Maven command so it runs in the project subdirectory, if there is one.
+            """
             return f"cd {rel} && {cmd}"
     else:
         def _mvn(cmd: str) -> str:
+            """
+            Prefix a Maven command so it runs in the project subdirectory, if there is one.
+            """
             return cmd
 
     plan.stages = [
@@ -360,6 +447,9 @@ def plan_maven(repo_root: Path) -> ExecutionPlan:
 # ─── Gradle adapter ───────────────────────────────────────────────────────────
 
 def plan_gradle(repo_root: Path) -> ExecutionPlan:
+    """
+    Build an execution plan for a Gradle project, including the Java version.
+    """
     plan = ExecutionPlan(ecosystem="gradle", runtime_version=None, runtime_source="default")
     java_version = None
 
@@ -382,6 +472,9 @@ def plan_gradle(repo_root: Path) -> ExecutionPlan:
 # ─── Go adapter ───────────────────────────────────────────────────────────────
 
 def plan_go(repo_root: Path) -> ExecutionPlan:
+    """
+    Build an execution plan for a Go project, taking the version from go.mod.
+    """
     plan = ExecutionPlan(ecosystem="go", runtime_version=None, runtime_source="default")
 
     gomod = repo_root / "go.mod"
@@ -402,6 +495,12 @@ def plan_go(repo_root: Path) -> ExecutionPlan:
 # ─── Cargo/Rust adapter ───────────────────────────────────────────────────────
 
 def plan_cargo(repo_root: Path) -> ExecutionPlan:
+    """
+    Build an execution plan for a Rust project.
+
+    The toolchain is read from rust-toolchain.toml or rust-toolchain when either
+    is present, since projects often pin a specific compiler release.
+    """
     plan = ExecutionPlan(ecosystem="cargo", runtime_version=None, runtime_source="default")
 
     rtf = repo_root / "rust-toolchain.toml"
@@ -423,6 +522,9 @@ def plan_cargo(repo_root: Path) -> ExecutionPlan:
 # ─── Gem/Ruby adapter ─────────────────────────────────────────────────────────
 
 def plan_gem(repo_root: Path) -> ExecutionPlan:
+    """
+    Build an execution plan for a Ruby project, honouring .ruby-version.
+    """
     plan = ExecutionPlan(ecosystem="gem", runtime_version=None, runtime_source="default")
 
     rbv = repo_root / ".ruby-version"
@@ -476,6 +578,16 @@ def detect_ecosystem(repo_root: Path) -> Optional[str]:
 
 
 def get_execution_plan(ecosystem: str, repo_root: Path) -> Optional[ExecutionPlan]:
+    """
+    Return the execution plan for a repository, detecting the ecosystem if needed.
+
+    When `ecosystem` is empty or unknown, it is inferred from the files present
+    in the repository. Returns None when no adapter matches.
+
+    Only the pip path is exercised by this research; the other ecosystems are
+    retained from an earlier, multi-ecosystem version of the pipeline and are
+    not validated.
+    """
     eco = (ecosystem or "").lower()
     # Auto-detect if unknown
     if eco in ("", "unknown", "none"):

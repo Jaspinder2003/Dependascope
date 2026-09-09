@@ -43,7 +43,158 @@ def _is_not_packageable(text: str) -> bool:
     return bool(text and _NOT_PACKAGEABLE.search(text))
 
 
+_NETWORK_INSTALL = re.compile(
+    r"read timed out|connection (?:reset|aborted|error)|max retries exceeded|"
+    r"failed to establish a new connection|temporary failure in name resolution|"
+    r"network is unreachable|proxyerror|newconnectionerror|"
+    r"could not fetch url|ssl(?:error|certificate|: )",
+    re.I,
+)
+
+
+def _is_index_unreachable(text: str) -> bool:
+    """
+    True when an install failed because pip could not see the package index —
+    not because the project or the dependency is broken.
+
+    The giveaway is "(from versions: none)": pip found ZERO candidate versions.
+    For packages like django, flask, fastapi or setuptools that is impossible
+    unless the index was unreachable, yet 30 of 49 recent baseline install
+    failures said exactly that, and every one was being recorded as "project
+    did not install BEFORE the update - already broken, not Dependabot's
+    fault". That is a false statement in the dataset, and it also produced
+    false TIER_2 install regressions when it struck the AFTER snapshot.
+
+    One important exception: pip also reports "from versions: none" when it
+    DID reach the index but filtered every version out by requires-python. It
+    says so explicitly when that happens, and that case is a real interpreter
+    mismatch which the interpreter-retry path handles, so it must not be
+    mistaken for a network fault.
+    """
+    if not text:
+        return False
+    if _NETWORK_INSTALL.search(text):
+        return True
+    if re.search(r"from versions:\s*none", text, re.I):
+        if re.search(r"ignored the following versions?.{0,80}?requires? a different python",
+                     text, re.I | re.S):
+            return False
+        return True
+    return False
+
+
+# Stdlib modules that simply do not exist on Windows. A project importing one
+# of these cannot run here at all — that is a platform gap in our harness, not
+# the project being broken, and must not be recorded as "already broken".
+_UNIX_ONLY_STDLIB = {
+    "fcntl", "resource", "termios", "grp", "pwd", "posix", "curses", "syslog",
+    "spwd", "crypt", "nis", "ossaudiodev", "readline", "tty", "pty",
+}
+
+_MODNOTFOUND = re.compile(r"(?:ModuleNotFoundError|ImportError):\s*No module named ['\"]([^'\"]+)['\"]")
+
+
+def _missing_modules(text: str) -> list[str]:
+    """Top-level module names pytest could not import, in first-seen order."""
+    seen = []
+    for m in _MODNOTFOUND.findall(text or ""):
+        top = m.split(".")[0]
+        if top and top not in seen:
+            seen.append(top)
+    return seen
+
+
+def _heal_missing_test_deps(py_root: Path, venv_dir: Path, missing: list[str],
+                            protected_dep: Optional[str], already: set) -> list[str]:
+    """
+    Best-effort `pip install` of support packages a test suite needs to be
+    collected at all (pytest-mock, responses, requests, jsonschema, ...).
+
+    51 of our baseline execution failures are a bare ModuleNotFoundError for an
+    ordinary installable package — the project's own test dependency that our
+    install step did not capture (it lived in an undeclared extra, a tox env,
+    or a CI-only file). That is our incomplete environment, not the project
+    failing, and it leaves the baseline with zero passing tests so the per-test
+    comparison has nothing to work with.
+
+    Safety rules that keep this from ever manufacturing a false regression:
+      * only *top-level* distribution names are installed (a dotted name like
+        'mcp.server' is a dependency's own submodule reorganisation — exactly
+        the breakage we are hunting — and is never touched);
+      * the dependency under test is never installed here, so a genuine
+        import-time break in the updated package is preserved;
+      * healing is applied identically to BEFORE and AFTER, so it can only ever
+        make the two snapshots more comparable, never less.
+
+    Returns the module names actually attempted this round.
+    """
+    py = _venv_python(venv_dir)
+    env = sx._safe_env(venv_dir=venv_dir)
+    prot = (protected_dep or "").strip().lower().replace("_", "-")
+    attempted = []
+    for mod in missing:
+        if mod in already or mod in _UNIX_ONLY_STDLIB:
+            continue
+        if mod.strip().lower().replace("_", "-") == prot:
+            continue
+        try:
+            subprocess.run([py, "-m", "pip", "install", "--quiet", "--prefer-binary",
+                            "--no-input", "--disable-pip-version-check", mod],
+                           cwd=str(py_root), capture_output=True, timeout=180, env=env)
+        except Exception:
+            pass
+        attempted.append(mod)
+    return attempted
+
+
+def parse_junit(xml_path: Path) -> dict:
+    """
+    Map every test the suite reported to pass | fail | error | skip.
+
+    Whole-suite exit codes throw away most of what a test run knows. 41% of our
+    rejected baselines are projects whose suite was *already* partly red before
+    Dependabot touched them, and under an exit-code comparison every one of
+    those is unusable — even when 200 tests passed before the update and 3 of
+    those exact tests fail after it. Per-test outcomes turn that into the
+    strongest evidence in the dataset: a named test, green at the parent
+    commit, red at the Dependabot commit, with its traceback.
+    """
+    out: dict[str, str] = {}
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(str(xml_path)).getroot()
+    except Exception:
+        return out
+    # pytest emits <testsuites><testsuite>, older versions just <testsuite>.
+    suites = root.iter("testsuite") if root.tag != "testcase" else []
+    for suite in suites:
+        for case in suite.iter("testcase"):
+            cls = (case.get("classname") or "").strip()
+            name = (case.get("name") or "").strip()
+            if not name:
+                continue
+            node_id = f"{cls}::{name}" if cls else name
+            outcome = "pass"
+            for child in case:
+                tag = child.tag.lower()
+                if tag == "failure":
+                    outcome = "fail"
+                elif tag == "error":
+                    outcome = "error"
+                elif tag == "skipped":
+                    outcome = "skip"
+            out[node_id] = outcome
+    return out
+
+
 def _tail(path: Path, n: int = 800) -> str:
+    """
+    Last `n` characters of a log file, or "" if it cannot be read.
+
+    Used to capture a short failure excerpt for the results database without
+    storing an entire build log. Deliberately swallows read errors: a missing
+    or unreadable log must not abort the run that produced it.
+    """
     try:
         t = path.read_text(encoding="utf-8", errors="ignore").strip()
         return t[-n:] if t else ""
@@ -52,6 +203,9 @@ def _tail(path: Path, n: int = 800) -> str:
 
 
 def _venv_python(venv_dir: Path) -> str:
+    """
+    Path to the Python interpreter inside `venv_dir`, per platform.
+    """
     return str(venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
 
 
@@ -93,22 +247,37 @@ def _install_test_extras(py_root: Path, venv_dir: Path) -> None:
     py = _venv_python(venv_dir)
     env = sx._safe_env(venv_dir=venv_dir)
 
-    for extra in _declared_test_extras(py_root)[:2]:
+    for extra in _declared_test_extras(py_root)[:3]:
         try:
             subprocess.run([py, "-m", "pip", "install", "--quiet", "--prefer-binary", f".[{extra}]"],
                            cwd=str(py_root), capture_output=True, timeout=300, env=env)
         except Exception:
             pass
 
+    # Every dev/test requirements file, not just the first match: projects
+    # routinely split them (requirements-test.txt for the runner, -dev.txt for
+    # everything else), and stopping at the first one leaves pytest unable to
+    # import the test modules. 38% of our baseline execution failures are
+    # collection errors, which is overwhelmingly this.
     for fname in _TEST_REQ_FILES:
-        req = py_root / fname
-        if req.exists():
+        if (py_root / fname).exists():
             try:
                 subprocess.run([py, "-m", "pip", "install", "--quiet", "--prefer-binary", "-r", fname],
                                cwd=str(py_root), capture_output=True, timeout=300, env=env)
             except Exception:
                 pass
-            break
+
+    # Same files one directory down (requirements/dev.txt, requirements/test.txt).
+    req_dir = py_root / "requirements"
+    if req_dir.is_dir():
+        for cand in ("dev.txt", "test.txt", "testing.txt", "local.txt"):
+            if (req_dir / cand).exists():
+                try:
+                    subprocess.run([py, "-m", "pip", "install", "--quiet", "--prefer-binary",
+                                    "-r", f"requirements/{cand}"],
+                                   cwd=str(py_root), capture_output=True, timeout=300, env=env)
+                except Exception:
+                    pass
 
 
 def run_snapshot(
@@ -120,6 +289,7 @@ def run_snapshot(
     work_root: Path,
     log_dir: Path,
     exec_plan_override: Optional[ExecutionPlan] = None,
+    protected_dep: Optional[str] = None,
 ) -> dict:
     """
     Returns:
@@ -148,6 +318,8 @@ def run_snapshot(
         "evidence_strength": "none",
         "failure_stage": None, "duration_seconds": 0.0,
         "exec_plan": None,
+        "tests": {},          # node_id -> pass | fail | error | skip
+        "platform_incompatible": False,
     }
     start_t = time.time()
     try:
@@ -190,17 +362,40 @@ def run_snapshot(
             return res
 
         slug = f"{safe_repo}__pr{pr_number}__{snapshot}__INSTALL"
-        install_sr = sx.run_stage(
-            stage_name="INSTALL", command=iplan.command, work_dir=work_dir,
-            stdout_path=log_dir / f"{slug}.stdout.txt", stderr_path=log_dir / f"{slug}.stderr.txt",
-            timeout=C.EXEC_TIMEOUT_TOTAL, venv_dir=venv_dir,
-        )
+
+        # A failed install is retried once when it looks like the package index
+        # was unreachable. These faults are transient and cluster in bursts, so
+        # a single extra attempt after a short pause recovers most of them —
+        # and every one recovered is a candidate that would otherwise have been
+        # libelled as an already-broken project.
+        for attempt in range(2):
+            install_sr = sx.run_stage(
+                stage_name="INSTALL", command=iplan.command, work_dir=work_dir,
+                stdout_path=log_dir / f"{slug}.stdout.txt", stderr_path=log_dir / f"{slug}.stderr.txt",
+                # EXEC_TIMEOUT_INSTALL, not EXEC_TIMEOUT_TOTAL: config defines a
+                # dedicated install budget and this call site was overriding it
+                # with the per-snapshot wall-clock limit, doubling the cost of
+                # every hung install (and run_stage retries once on top).
+                timeout=C.EXEC_TIMEOUT_INSTALL, venv_dir=venv_dir,
+            )
+            if install_sr["exit_code"] == 0 or install_sr["result"] == "TIMEOUT":
+                break
+            peek = _tail(Path(install_sr["stderr_path"])) or _tail(Path(install_sr["stdout_path"]))
+            if not _is_index_unreachable(peek) or attempt == 1:
+                break
+            time.sleep(20)
+
         if install_sr["exit_code"] != 0:
             excerpt = _tail(Path(install_sr["stderr_path"])) or _tail(Path(install_sr["stdout_path"]))
             res["install_excerpt"] = excerpt
             res["failure_stage"] = "INSTALL"
             if install_sr["result"] == "TIMEOUT":
                 res["install_result"] = "TIMEOUT"
+            elif _is_index_unreachable(excerpt):
+                # Our connectivity, not the project. Must never be reported as
+                # baseline breakage, and must never become a TIER_2 install
+                # regression when it happens on the AFTER snapshot.
+                res["install_result"] = "NETWORK"
             elif _is_not_packageable(excerpt):
                 # The repo has a manifest but is not actually pip-installable
                 # (flat layout setuptools can't auto-discover, etc). CI never
@@ -241,16 +436,53 @@ def run_snapshot(
 
         # ── 5a. Real test suite ──────────────────────────────────────────
         if exec_plan.strategy == "pytest_real":
+            junit_path = log_dir / f"{slug_x}.junit.xml"
+            pytest_cmd = f'python -m pytest -q -p no:cacheprovider --junitxml="{junit_path.as_posix()}"'
+            # -p no:cacheprovider keeps pytest from writing .pytest_cache into
+            # the worktree, which would differ between the two snapshots.
             exec_sr = sx.run_stage(
-                stage_name="EXEC", command="python -m pytest -q", work_dir=py_root,
+                stage_name="EXEC", command=pytest_cmd, work_dir=py_root,
                 stdout_path=stdout_x, stderr_path=stderr_x,
                 timeout=C.EXEC_TIMEOUT_TOTAL, venv_dir=venv_dir,
             )
+
+            # Heal a collection-time failure caused by a missing support package
+            # (pytest exit code 2 = collection error), then re-run. See
+            # _heal_missing_test_deps for why this cannot create a false
+            # regression. Bounded to 3 rounds so a genuinely unsatisfiable
+            # import can never loop.
+            healed: set = set()
+            for _round in range(3):
+                if exec_sr["exit_code"] != 2 or exec_sr["result"] == "TIMEOUT":
+                    break
+                text = _tail(Path(exec_sr["stderr_path"]), 4000) + "\n" + _tail(Path(exec_sr["stdout_path"]), 4000)
+                missing = _missing_modules(text)
+                platform_gap = [m for m in missing if m in _UNIX_ONLY_STDLIB]
+                if platform_gap:
+                    res["platform_incompatible"] = True
+                    res["execution_excerpt"] = (f"test collection requires Unix-only module(s) "
+                                                 f"unavailable on this OS: {', '.join(platform_gap)}")
+                    break
+                to_try = [m for m in missing if m not in healed and "." not in m]
+                if not to_try:
+                    break
+                attempted = _heal_missing_test_deps(py_root, venv_dir, to_try, protected_dep, healed)
+                healed.update(attempted)
+                if not attempted:
+                    break
+                exec_sr = sx.run_stage(
+                    stage_name="EXEC", command=pytest_cmd, work_dir=py_root,
+                    stdout_path=stdout_x, stderr_path=stderr_x,
+                    timeout=C.EXEC_TIMEOUT_TOTAL, venv_dir=venv_dir,
+                )
+
             passed = exec_sr["exit_code"] == 0
             res["execution_result"] = "TIMEOUT" if exec_sr["result"] == "TIMEOUT" else ("PASS" if passed else "FAIL")
+            res["tests"] = parse_junit(junit_path)
             if not passed:
                 res["failure_stage"] = "EXECUTION"
-                res["execution_excerpt"] = _tail(Path(exec_sr["stderr_path"])) or _tail(Path(exec_sr["stdout_path"]))
+                res["execution_excerpt"] = res.get("execution_excerpt") or (
+                    _tail(Path(exec_sr["stderr_path"])) or _tail(Path(exec_sr["stdout_path"])))
 
         # ── 5b. Import-smoke fallback ────────────────────────────────────
         elif exec_plan.strategy == "import_smoke":

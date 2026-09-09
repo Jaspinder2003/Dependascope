@@ -28,6 +28,32 @@ logging.basicConfig(
 logger = logging.getLogger("fetch_live_github")
 
 
+# Python manifests come in many shapes. Matching only requirements.txt /
+# pyproject.toml / Pipfile left half of all collected Python PRs with a NULL
+# ecosystem (and, via the same list, marked COMPLEX), so discover() dropped
+# them. Covers setup.py/cfg, the lockfiles, constraints, and the
+# requirements-dev.txt / requirements/dev.txt naming variants.
+_PY_MANIFEST_NAMES = {
+    "requirements.txt", "pyproject.toml", "Pipfile", "Pipfile.lock",
+    "poetry.lock", "uv.lock", "pdm.lock", "setup.py", "setup.cfg",
+    "constraints.txt", "environment.yml", "environment.yaml",
+}
+_PY_REQ_RE = re.compile(r"(^|/)[\w.-]*(requirements|constraints)[\w.-]*\.(txt|in)$", re.I)
+
+
+def _is_python_manifest(fp: str) -> bool:
+    """True if this path is a Python dependency manifest or lockfile."""
+    if not fp:
+        return False
+    name = fp.rsplit("/", 1)[-1]
+    if name in _PY_MANIFEST_NAMES:
+        return True
+    if _PY_REQ_RE.search(fp):
+        return True
+    # requirements/*.txt and requirements/*.in laid out as a directory
+    return bool(re.search(r"(^|/)requirements/[\w.-]+\.(txt|in)$", fp, re.I))
+
+
 def search_dependabot_prs(conn, query: str, max_pages: int = 10) -> list[dict]:
     """Search GitHub for Dependabot PRs matching a search query."""
     url = f"{C.GITHUB_API_BASE}/search/issues"
@@ -62,6 +88,14 @@ def process_pr_item(conn, item: dict, cfg=None, stats=None) -> bool:
     stats = stats if stats is not None else {}
 
     def drop(reason: str) -> bool:
+        """
+        Record that this pull request was rejected for `reason` and return False.
+
+        Every rejection is tallied so the collector can report exactly why
+        candidates were discarded. Those counts are the evidence that the
+        green-to-red requirement, rather than a lack of effort, is what makes
+        qualifying pull requests scarce.
+        """
         stats[reason] = stats.get(reason, 0) + 1
         return False
 
@@ -143,7 +177,7 @@ def process_pr_item(conn, item: dict, cfg=None, stats=None) -> bool:
         if fp.endswith("package.json") or fp.endswith("package-lock.json") or fp.endswith("yarn.lock"):
             ecosystem = "npm"
             break
-        elif fp.endswith("requirements.txt") or fp.endswith("pyproject.toml") or fp.endswith("Pipfile"):
+        elif _is_python_manifest(fp):
             ecosystem = "pip"
             break
         elif fp.endswith("pom.xml"):
@@ -166,6 +200,8 @@ def process_pr_item(conn, item: dict, cfg=None, stats=None) -> bool:
     manifest_files = [
         "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
         "requirements.txt", "pyproject.toml", "Pipfile", "Pipfile.lock",
+        "setup.py", "setup.cfg", "poetry.lock", "uv.lock", "pdm.lock",
+        "constraints.txt", "environment.yml", "environment.yaml",
         "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile", "Gemfile.lock",
         "go.mod", "go.sum", "Cargo.toml", "Cargo.lock"
     ]
@@ -209,6 +245,15 @@ def process_pr_item(conn, item: dict, cfg=None, stats=None) -> bool:
 
 
 def main():
+    """
+    Command-line entry point for collection.
+
+    Builds the search queries, runs them against the GitHub API, applies the
+    green-to-red CI verification and the project quality gates to every result,
+    and writes the survivors into the research database. Progress and rejection
+    tallies are logged as it goes, so a long run can be monitored and stopped
+    safely at any point.
+    """
     parser = argparse.ArgumentParser(description="Fetch fresh Dependabot PRs from GitHub API")
     # NOTE: previously defaulted to "... is:unmerged status:failure", which
     # biases the search toward PRs GitHub already flagged as failing —  in
@@ -252,14 +297,39 @@ def main():
     # Build search queries across ecosystems or search term variations
     base_queries = []
     if args.ecosystem in ("pip", "python"):
-        base_queries.append(f"{args.query} label:pip")
-        base_queries.append(f"{args.query} label:python")
-        base_queries.append(f"{args.query} requirements.txt")
-        base_queries.append(f"{args.query} pyproject.toml")
-        base_queries.append(f"{args.query} poetry")
-        base_queries.append(f"{args.query} pytest")
-        base_queries.append(f"{args.query} Pipfile")
-        base_queries.append(f"{args.query} setup.py")
+        # Each term is a separate 1,000-result window, so coverage scales with
+        # the number of distinct terms. The first eight are the original set;
+        # the rest add other Python manifests, common tooling, and the
+        # dependency names that dominate real Python Dependabot PR titles.
+        # Quality gates are unchanged -- this only widens what we look at.
+        for _term in (
+            "label:pip", "label:python",
+            "requirements.txt", "pyproject.toml", "Pipfile", "setup.py",
+            "poetry", "pytest",
+            # additional Python manifests / toolchain files
+            "setup.cfg", "uv.lock", "poetry.lock", "constraints.txt",
+            "tox.ini", "environment.yml", "requirements-dev",
+            # ubiquitous tooling that appears in a large share of Python PRs
+            "ruff", "mypy", "black", "flake8", "coverage", "sphinx",
+            "pytest-cov", "pytest-asyncio", "setuptools", "wheel",
+            # high-frequency runtime dependencies
+            "numpy", "pandas", "requests", "urllib3", "django", "flask",
+            "fastapi", "pydantic", "sqlalchemy", "boto3", "aiohttp", "click",
+            "jinja2", "certifi", "cryptography", "protobuf", "pillow",
+            "scipy", "matplotlib", "torch", "transformers", "openai",
+            # second batch: further high-frequency PyPI packages, to widen
+            # coverage once the first 47 terms were exhausted
+            "httpx", "starlette", "uvicorn", "gunicorn", "celery", "redis",
+            "psycopg2", "pymongo", "sqlmodel", "alembic", "marshmallow",
+            "scikit-learn", "seaborn", "plotly", "streamlit", "gradio",
+            "langchain", "tiktoken", "anthropic", "sentry-sdk", "loguru",
+            "tenacity", "orjson", "grpcio", "kubernetes", "paramiko",
+            "selenium", "playwright", "beautifulsoup4", "lxml", "pyarrow",
+            "polars", "duckdb", "typing-extensions", "packaging", "attrs",
+            "python-dateutil", "pyyaml", "jsonschema", "rich", "typer",
+            "pre-commit", "tox", "pytest-mock", "isort", "bandit",
+        ):
+            base_queries.append(f"{args.query} {_term}")
     elif args.ecosystem == "all":
         base_queries.append(args.query)
         for eco in ["npm", "pip", "maven", "gradle", "cargo", "go"]:
@@ -274,6 +344,14 @@ def main():
     # created-date gives each month its own independent 1000-result budget,
     # which is what actually unlocks a large fresh pool.
     def _month_windows(since: str) -> list[str]:
+        """
+        Build one monthly `created:` filter per month from `since` to today.
+
+        GitHub caps any single search at 1,000 results. Partitioning by creation
+        date gives every month its own independent budget, which is what makes a
+        large collection possible at all; a single unpartitioned query would
+        return only the first 1,000 matches no matter how many exist.
+        """
         from datetime import date
         y, m, _ = (int(x) for x in since.split("-"))
         today = date.today()
@@ -285,6 +363,12 @@ def main():
         return out
 
     windows = _month_windows(args.since)
+    # Walk the windows in a random order. The list is built chronologically and
+    # a full sweep takes ~28h, so every restart used to replay the same early
+    # windows and rediscover PRs already in the database. Shuffling makes each
+    # run sample the whole range, so coverage accumulates across restarts.
+    import random as _random
+    _random.shuffle(windows)
     queries = [f"{bq} {w}" for w in windows for bq in base_queries]
     logger.info(f"Built {len(queries)} queries: {len(base_queries)} base x {len(windows)} monthly windows "
                 f"since {args.since} (each window has its own 1000-result cap)")

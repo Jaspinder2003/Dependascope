@@ -29,6 +29,13 @@ _SESSION: Optional[requests.Session] = None
 
 
 def _get_session() -> requests.Session:
+    """
+    Return the process-wide requests session, creating it on first use.
+
+    The session carries the API version headers and, when GITHUB_TOKEN is set,
+    the bearer token. Without a token the API allows only 60 requests an hour,
+    so the absence of one is logged as a warning rather than passing silently.
+    """
     global _SESSION
     if _SESSION is None:
         _SESSION = requests.Session()
@@ -44,6 +51,12 @@ def _get_session() -> requests.Session:
 
 
 def _cache_key(url: str, params: Optional[dict] = None) -> str:
+    """
+    Stable cache key for a URL and its query parameters.
+
+    Parameters are sorted so that the same request always produces the same
+    key regardless of dictionary ordering.
+    """
     s = url
     if params:
         s += "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -116,6 +129,9 @@ def get(
 
 
 def get_pr(conn: Any, owner: str, repo: str, pr_number: int) -> Optional[dict]:
+    """
+    Fetch a single pull request. Returns None when unavailable.
+    """
     url = f"{C.GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}"
     data, code = get(url, conn)
     return data
@@ -123,6 +139,13 @@ def get_pr(conn: Any, owner: str, repo: str, pr_number: int) -> Optional[dict]:
 
 def get_pr_files(conn: Any, owner: str, repo: str, pr_number: int,
                  per_page: int = 100) -> list[dict]:
+    """
+    Fetch every file changed by a pull request, following pagination.
+
+    The file list determines both the ecosystem (from the manifests touched)
+    and whether the change is manifest-only, so it must be complete rather
+    than just the first page.
+    """
     url = f"{C.GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/files"
     all_files = []
     page = 1
@@ -138,30 +161,54 @@ def get_pr_files(conn: Any, owner: str, repo: str, pr_number: int,
 
 
 def get_pr_commits(conn: Any, owner: str, repo: str, pr_number: int) -> list[dict]:
+    """
+    Fetch the commits belonging to a pull request. Empty list when unavailable.
+    """
     url = f"{C.GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/commits"
     data, _ = get(url, conn, params={"per_page": 100})
     return data or []
 
 
 def get_repo(conn: Any, owner: str, repo: str) -> Optional[dict]:
+    """
+    Fetch repository metadata, used for the stars, commits and contributors gates.
+    """
     url = f"{C.GITHUB_API_BASE}/repos/{owner}/{repo}"
     data, _ = get(url, conn)
     return data
 
 
 def get_check_runs(conn: Any, owner: str, repo: str, ref: str) -> Optional[dict]:
+    """
+    Fetch the check runs recorded for a commit.
+
+    One of the two sources of CI state; modern GitHub Actions results appear
+    here rather than in the legacy combined status.
+    """
     url = f"{C.GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{ref}/check-runs"
     data, _ = get(url, conn, params={"per_page": 100})
     return data
 
 
 def get_commit_statuses(conn: Any, owner: str, repo: str, ref: str) -> Optional[dict]:
+    """
+    Fetch the legacy combined commit status.
+
+    The second source of CI state, used alongside check runs because older
+    projects and third-party CI services still report through this API.
+    """
     url = f"{C.GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{ref}/status"
     data, _ = get(url, conn)
     return data
 
 
 def check_rate_limit(conn: Any) -> dict:
+    """
+    Fetch the current API rate-limit state, bypassing the cache.
+
+    Always requested fresh, since a cached rate limit would defeat the purpose
+    of checking it.
+    """
     url = f"{C.GITHUB_API_BASE}/rate_limit"
     data, _ = get(url, conn, force_refresh=True)
     return data or {}
@@ -210,6 +257,42 @@ def check_commit_ci_status(conn: Any, owner: str, repo: str, sha: str) -> Option
                 return "success"
 
     return None
+
+
+def commit_ci_breakdown(conn: Any, owner: str, repo: str, sha: str) -> tuple[int, int]:
+    """
+    (successful_checks, failed_checks) for a commit, counting only decisive
+    conclusions.
+
+    check_commit_ci_status() collapses this to a single verdict and calls the
+    commit "failure" if *any* job failed — right for picking green->red
+    candidates, far too blunt for deciding whether to bother reproducing one.
+    A repo whose lint or CodeQL job is red while its test suite is entirely
+    green is not a broken project, and discarding it costs us a candidate for
+    no reason.
+    """
+    n_success = n_failure = 0
+
+    statuses = get_commit_statuses(conn, owner, repo, sha)
+    if statuses and statuses.get("total_count", 0) > 0:
+        for s in statuses.get("statuses", []) or []:
+            if s.get("state") == "success":
+                n_success += 1
+            elif s.get("state") in ("failure", "error"):
+                n_failure += 1
+
+    check_runs = get_check_runs(conn, owner, repo, sha)
+    if check_runs and check_runs.get("total_count", 0) > 0:
+        for r in check_runs.get("check_runs", []):
+            if r.get("status") != "completed":
+                continue
+            c = r.get("conclusion")
+            if c == "success":
+                n_success += 1
+            elif c in ("failure", "timed_out"):
+                n_failure += 1
+
+    return n_success, n_failure
 
 
 def get_paginated_count(url: str, params: Optional[dict] = None) -> Optional[int]:

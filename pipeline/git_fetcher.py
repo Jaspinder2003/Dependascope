@@ -9,6 +9,8 @@ Repositories are cached under REPO_CACHE_DIR/owner__repo.
 
 from __future__ import annotations
 import logging
+import os
+import re
 import subprocess
 import sys
 import time
@@ -49,6 +51,17 @@ def _run(cmd: list[str], cwd: Optional[Path] = None,
 def repo_cache_path(repo: str) -> Path:
     """owner/repo → cache directory path."""
     safe = repo.replace("/", "__")
+    # Windows silently strips trailing dots and spaces from directory names, so
+    # a repo like "Ryanditko/E.V." is created as "Ryanditko__E.V" and every
+    # later exists() check fails — reported as "repo cache missing" and the
+    # candidate rejected for a fetch that actually succeeded. Only names that
+    # Windows cannot represent are rewritten, so every existing cache
+    # directory keeps its current path.
+    if os.name == "nt":
+        stripped = safe.rstrip(". ")
+        if stripped != safe:
+            safe = stripped + "_dot"
+        safe = re.sub(r'[<>:"|?*]', "_", safe)
     return C.REPO_CACHE_DIR / safe
 
 
@@ -81,10 +94,26 @@ def clone_or_update(repo: str, head_sha: str, before_sha: Optional[str],
 
     # ── Helper: check if a SHA is already present ─────────────────────────────
     def sha_present(sha: str) -> bool:
+        """
+        True when `sha` already exists in the local cache clone.
+
+        Checked before every fetch so that repeated candidates from the same
+        repository do not re-download objects already held locally.
+        """
         rc, _, _ = _run(["git", "-C", str(cache), "cat-file", "-e", sha])
         return rc == 0
 
     def fetch_sha(sha: str) -> tuple[bool, str]:
+        """
+        Ensure `sha` is present locally, fetching it if needed.
+
+        Returns (success, error_message). Tries progressively broader strategies:
+        the pull request ref first, since GitHub always publishes it and it works
+        even when the contributor's branch has since been deleted, then falling
+        back to wider fetches. Shallow depths are used throughout, because the
+        pipeline needs only the two commits under comparison rather than full
+        history.
+        """
         if sha_present(sha):
             return True, ""
 
@@ -208,6 +237,90 @@ def checkout_snapshot_worktree(repo: str, sha: str, work_dir: Path) -> tuple[boo
     if rc != 0:
         return False, f"git checkout {sha} failed: {err}"
     return True, ""
+
+
+_BOT_AUTHORS = ("dependabot[bot]", "dependabot-preview[bot]", "dependabot")
+
+
+def _commit_author(cache: Path, sha: str) -> Optional[str]:
+    """
+    Author name of `sha`, or None when the commit cannot be read.
+    """
+    rc, out, _ = _run(["git", "-C", str(cache), "log", "-1", "--format=%an", sha])
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def _is_bot_commit(cache: Path, sha: str) -> bool:
+    """
+    True when `sha` was authored by a known bot account.
+
+    Used to anchor the before/after pair on the Dependabot commit itself
+    rather than on whatever happens to sit at the branch head, which may
+    include later human commits that would contaminate the comparison.
+    """
+    author = _commit_author(cache, sha)
+    return bool(author) and any(b in author.lower() for b in _BOT_AUTHORS)
+
+
+def resolve_dependabot_pair(repo: str, head_sha: str) -> tuple[Optional[str], Optional[str], str]:
+    """
+    Anchor the BEFORE/AFTER pair on the Dependabot commit itself.
+
+    Returns (after_sha, before_sha, message); (None, None, reason) when the
+    pair cannot be anchored safely.
+
+    The SHAs recorded at collection time are the PR head and the PR's *base*,
+    and the base drifts: once the default branch moves on after the PR is
+    opened, the recorded before_sha stops being the parent of the head and can
+    even stop being an ancestor of it entirely (observed in 6 of 10 sampled
+    mismatches). Rejecting those loses good candidates while the genuinely
+    correct BEFORE commit — the Dependabot commit's own parent — is sitting
+    one step away in the graph.
+
+    Two shapes are handled:
+      A. head_sha IS the Dependabot commit           -> anchor = head_sha
+      B. head_sha is a merge of the base branch into
+         the Dependabot branch, whose first parent
+         is the Dependabot commit                     -> anchor = head_sha^1
+
+    In both cases BEFORE becomes anchor^1, so the BEFORE->AFTER diff is
+    exactly one Dependabot commit — a stronger causality claim than the
+    recorded pair, not a weaker one.
+
+    Deliberately gives up rather than guessing when the anchor's parent is
+    itself a bot commit: that means a rebased branch carrying several bumps,
+    where one commit back does not isolate a single dependency change.
+    """
+    cache = repo_cache_path(repo)
+    if not cache.exists():
+        return None, None, "repo cache missing"
+
+    anchor = None
+    if _is_bot_commit(cache, head_sha):
+        anchor = head_sha
+        shape = "head_is_bot_commit"
+    else:
+        rc, out, _ = _run(["git", "-C", str(cache), "rev-parse", f"{head_sha}^1"])
+        first_parent = out.strip() if rc == 0 else ""
+        if first_parent and _is_bot_commit(cache, first_parent):
+            anchor = first_parent
+            shape = "head_is_merge_of_bot_commit"
+
+    if not anchor:
+        return None, None, "no dependabot commit at head or head^1"
+
+    rc, out, _ = _run(["git", "-C", str(cache), "rev-parse", f"{anchor}^1"])
+    parent = out.strip() if rc == 0 else ""
+    if not parent:
+        return None, None, "dependabot commit has no reachable parent (shallow boundary)"
+
+    if _is_bot_commit(cache, parent):
+        # Rebased branch with several bumps stacked on it; one step back does
+        # not isolate a single dependency update, so this is not usable
+        # evidence and must not be guessed at.
+        return None, None, "parent of the dependabot commit is also a bot commit (stacked bumps)"
+
+    return anchor, parent, f"anchored_on_dependabot_commit ({shape})"
 
 
 def verify_sha_pairing(repo: str, head_sha: str, before_sha: str) -> tuple[bool, str, str]:

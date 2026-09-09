@@ -20,9 +20,9 @@ from regression_pipeline import db as rdb
 #   "Bump requests from 2.32.3 to 2.33.0"
 #   "Build(deps-dev): Bump vite from 8.1.4 to 8.1.5"
 #   "chore(deps): update python-dateutil requirement from >=2.9.0 to >=2.9.0.post0"
-_TITLE_BUMP_RE = re.compile(r"bump\s+(?P<dep>[\w@./-]+)\s+from\s+(?P<old>\S+)\s+to\s+(?P<new>\S+)", re.IGNORECASE)
+_TITLE_BUMP_RE = re.compile(r"bump\s+(?P<dep>[\w@./\[\]-]+)\s+from\s+(?P<old>\S+)\s+to\s+(?P<new>\S+)", re.IGNORECASE)
 _TITLE_UPDATE_REQ_RE = re.compile(
-    r"update\s+(?P<dep>[\w@./-]+)\s+requirement\s+from\s+(?P<old>\S+)\s+to\s+(?P<new>\S+)", re.IGNORECASE)
+    r"update\s+(?P<dep>[\w@./\[\]-]+)\s+requirement\s+from\s+(?P<old>\S+)\s+to\s+(?P<new>\S+)", re.IGNORECASE)
 
 # Same heuristic purified_reproduce.classify_cohort() uses: these words in the
 # title signal a grouped multi-dependency update, which breaks the
@@ -32,6 +32,15 @@ _GROUPED_TITLE_RE = re.compile(r"(?i)\bgroup\b|\bupdates\b|\bdependencies\b|\bpa
 
 
 def _parse_title_dependency(title: str) -> tuple[str | None, str | None, str | None]:
+    """
+    Extract (dependency, old_version, new_version) from a pull request title.
+
+    Dependabot titles follow a small number of fixed shapes, such as
+    "Bump X from 1.0 to 2.0" and "Update X requirement from ==1.* to ==2.*".
+    This is the fallback used when the dependency could not be read from the
+    collected manifest diff. Returns a triple of Nones when no pattern matches,
+    leaving the candidate's dependency unknown rather than guessing.
+    """
     if not title:
         return None, None, None
     for pattern in (_TITLE_BUMP_RE, _TITLE_UPDATE_REQ_RE):
@@ -48,7 +57,7 @@ def _parse_title_dependency(title: str) -> tuple[str | None, str | None, str | N
 # contributing 46. That is both wasted compute (a repo with a broken baseline
 # fails identically for all 46) and a dataset-validity problem — confirmed
 # cases clustered in two or three repos would be weak evidence in a paper.
-MAX_PER_REPO = 3
+MAX_PER_REPO = 10
 
 
 def prune_over_cap(conn=None) -> int:

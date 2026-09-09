@@ -32,6 +32,13 @@ STALE_SECONDS = 900
 
 
 def _lock_path(repo: str) -> Path:
+    """
+    Path of the lock file representing `repo`.
+
+    The slash in an "owner/name" repository is replaced with a double
+    underscore so the lock lives as a single flat file rather than forcing a
+    nested directory per owner.
+    """
     return LOCK_DIR / (repo.replace("/", "__") + ".lock")
 
 

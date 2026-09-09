@@ -1,45 +1,61 @@
-# Raw research datasets
-Partition (1)/
-Partition (2)/
-Derived Sample/
-__MACOSX/
-*.rar
-*.zip
-*.xlsx
+# ─── Secrets ──────────────────────────────────────────────────────────────────
+# The GitHub token is read from the environment only and must never be committed.
+.env
+.env.*
+!.env.example
+*token*.txt
+*credentials*
 
-# Generated research data
-output/
-outputs/
-cache/
-github_api_cache/
+# ─── Generated working data ───────────────────────────────────────────────────
+# Recreated by running the pipeline; large and high-churn.
 repository_cache/
-repo_snapshots/
+github_api_cache/
 execution_logs/
+worktrees/
+repo_snapshots/
+cache/
 logs/
+*.log
+
+# ─── Databases ────────────────────────────────────────────────────────────────
+# The research pool grows to tens of gigabytes. The results database is small
+# enough to share, but is distributed alongside the code rather than committed.
 *.sqlite
 *.sqlite3
+*.sqlite-wal
+*.sqlite-shm
 *.db
 *.parquet
-*.csv
 
-# Python
+# ─── Exports ──────────────────────────────────────────────────────────────────
+# Regenerated with: run_regression_pipeline.py export
+data/*.csv
+output/
+outputs/
+
+# ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
 env/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+_venv/
 
-# Secrets
-.env
-.env.*
-!.env.example
-
-# IDE and OS
+# ─── Editor and OS ────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+*.swp
+*~
 
-# AI conversation history
-**/CONVERSATION_HISTORY.md
+# ─── Local backups and scratch ────────────────────────────────────────────────
+*.bak
+*.bak_*
+*.orig
+*.stackdump
+_not_for_handoff/
